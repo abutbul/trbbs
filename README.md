@@ -1,4 +1,21 @@
 # Telegram Rule Based Bot System
+- [Telegram Rule Based Bot System](#telegram-rule-based-bot-system)
+  - [Project Overview](#project-overview)
+    - [Primary Purpose](#primary-purpose)
+  - [Key Features](#key-features)
+  - [Getting Started](#getting-started)
+    - [Prerequisites](#prerequisites)
+    - [Setup and Run](#setup-and-run)
+  - [System Architecture](#system-architecture)
+  - [Key Design Decisions](#key-design-decisions)
+  - [Work Done](#work-done)
+    - [System Architecture](#system-architecture-1)
+    - [Core Components](#core-components)
+    - [Documentation](#documentation)
+  - [Next Steps](#next-steps)
+    - [Short-term Tasks](#short-term-tasks)
+    - [Medium-term Goals](#medium-term-goals)
+    - [Long-term Vision](#long-term-vision)
 
 ## Project Overview
 
