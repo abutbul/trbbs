@@ -27,7 +27,7 @@ The system provides a framework for creating and operating multiple Telegram bot
 
 1. Clone the repository:
    ```
-   git clone [repository URL]
+   git clone https://github.com/abutbul/trbbs
    cd trbbs
    ```
 
