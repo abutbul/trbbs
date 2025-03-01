@@ -1,0 +1,62 @@
+services:
+  redis:
+    image: redis:latest
+    ports:
+      - "6379:6379"
+    command: redis-server --requirepass ${REDIS_PASSWORD:-changeme}
+    volumes:
+      - redis-data:/data
+    networks:
+      - app-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 3
+
+  telegram-pubsub:
+    build:
+      context: .
+      dockerfile: Dockerfile.telegram-pubsub
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-changeme}
+      - BOT_CONFIG_PATH=/app/bot_config.json
+    volumes:
+      - ./bot_config.json:/app/bot_config.json:ro
+    depends_on:
+      - redis
+    networks:
+      - app-network
+    restart: on-failure
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 2
+      start_period: 30s
+
+  bot-logic:
+    build:
+      context: .
+      dockerfile: Dockerfile.bot-logic
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-changeme}
+    volumes:
+      - ./bot_config.json:/app/bot_config.json:ro
+    depends_on:
+      - redis
+    networks:
+      - app-network
+    restart: on-failure
+
+networks:
+  app-network:
+    driver: bridge
+
+volumes:
+  redis-data:

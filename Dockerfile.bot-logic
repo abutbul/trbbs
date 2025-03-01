@@ -1,0 +1,30 @@
+FROM python:3.10-slim
+
+WORKDIR /app
+
+# Install dependencies in a single step
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    redis-tools \
+    curl && \
+    rm -rf /var/lib/apt/lists/*
+
+# Copy application files
+COPY bot_logic.py /app/
+COPY bot_logic/ /app/bot_logic/
+COPY scripts/ /app/scripts/
+RUN chmod +x /app/scripts/*
+
+# Install dependencies directly
+RUN pip install --no-cache-dir redis aioredis python-telegram-bot httpx
+
+# Set environment variables
+ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+  CMD redis-cli -h $REDIS_HOST -p $REDIS_PORT -a "$REDIS_PASSWORD" ping | grep PONG
+
+# Command to run
+CMD ["python", "-u", "bot_logic.py"]

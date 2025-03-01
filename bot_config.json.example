@@ -1,0 +1,56 @@
+{
+  "bots": [
+    {
+      "bot_name": "dardasher",
+      "username": "DardakerBot",
+      "token": "",
+      "enabled": true,
+      "rules": [
+        {
+          "regex": "^\\/help$",
+          "response_type": "message",
+          "response_content": "Available commands:\n/help - Show this message\n/time - Show current time\n/status - Check system status",
+          "context": "both"
+        },
+        {
+          "regex": "^\\/time$",
+          "response_type": "script",
+          "response_content": "date",
+          "context": "both"
+        },
+        {
+          "regex": "^\\/status$",
+          "response_type": "script",
+          "response_content": "scripts/check_status.sh",
+          "context": "dm"
+        }
+      ]
+    },
+    {
+      "bot_name": "shter",
+      "username": "ManakBot",
+      "token": "",
+      "enabled": true,
+      "rules": [
+        {
+          "regex": "^/info$",
+          "response_type": "message",
+          "response_content": "This is the second bot. Available commands:\n/info - Show this message\n/date - Show current date\n/help - Show available commands",
+          "context": "both"
+        },
+        {
+          "regex": "^/date$",
+          "response_type": "script",
+          "response_content": "/usr/bin/date",
+          "context": "both"
+        },
+        {
+          "regex": "^\\/help$",
+          "response_type": "message",
+          "response_content": "Available commands for shoter bot:\n/info - Show bot information\n/date - Show current date\n/help - Show this help message",
+          "context": "both"
+        }
+      ]
+    }
+  ]
+}

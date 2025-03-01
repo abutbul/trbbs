@@ -1,0 +1,11 @@
+# Ignore all dotfiles
+.*
+
+# Except for .gitignore itself
+!.gitignore
+
+# Ignore VS Code specific files
+.vscode/
+.vscode-server/
+bot_config.json
+memory-bank/

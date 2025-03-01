@@ -1,0 +1,40 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install dependencies in a single step
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    curl \
+    redis-tools \
+    ca-certificates && \
+    rm -rf /var/lib/apt/lists/* && \
+    pip install --no-cache-dir --upgrade pip
+
+# Install dependencies directly
+RUN pip install --no-cache-dir redis aioredis aiohttp httpx "python-telegram-bot[ext]==20.6"
+
+# Create scripts directory
+RUN mkdir -p /app/scripts
+
+# Copy application files
+COPY telegram_bot/ /app/telegram_bot/
+COPY run_telegram_bot.py /app/
+
+# Set environment variables
+ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONASYNCIODEBUG=1
+
+# Optional debug variable
+ENV DEBUG_MODE=false
+
+# Set the bot config path environment variable
+ENV BOT_CONFIG_PATH=/app/bot_config.json
+
+# Health check - make it more strict
+HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=2 \
+  CMD curl -f http://localhost:8080/health || exit 1
+
+# Command to run
+CMD ["python", "-u", "run_telegram_bot.py"]
