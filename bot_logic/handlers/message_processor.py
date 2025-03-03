@@ -1,10 +1,13 @@
+import os
 import json
 import logging
 import subprocess
+import httpx  # Add this import
 from bot_logic.core.config import load_bot_config
 from bot_logic.core.status import service_status
 from bot_logic.handlers.rule_matcher import ensure_bot_usernames, find_all_matching_bot_rules, get_available_commands
 from bot_logic.services.response_service import send_response
+from bot_logic.services.api_service import send_chat_message  # Add this import
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +72,11 @@ async def process_matching_rules(matches, source_type, source_id, chat_id, chat_
         elif response_type == "script":
             # Execute script and return output
             await execute_script_response(response_content, source_type, source_id, response_token, chat_id, chat_type)
+        elif response_type == "api-chat":
+            # New type: API chat response
+            # Use the original message for processing
+            original_message = rule.get("original_message", "")
+            await execute_api_chat_response(original_message, source_type, source_id, response_token, chat_id, chat_type)
         else:
             logger.error(f"Unknown response type: {response_type}")
 
@@ -83,6 +91,38 @@ async def execute_script_response(script_command, source_type, source_id, respon
         service_status.record_error(e)
     
     await send_response(source_type, source_id, script_response, {
+        "bot_token": response_token,
+        "chat_id": chat_id,
+        "chat_type": chat_type
+    })
+
+async def execute_api_chat_response(message_content, source_type, source_id, response_token, chat_id, chat_type):
+    """Send message to API chat service and return the response."""
+    try:
+        # Extract the message content (everything after "bot:")
+        if message_content.lower().startswith("bot:"):
+            query = message_content[4:].strip()  # Remove 'bot:' and trim spaces
+        else:
+            query = message_content.strip()
+            
+        # Log the query being sent to the API
+        logger.info(f"Sending request to API chat: {query[:100]}...")
+        
+        # Use the API service without sending an interim message
+        success, response, error = await send_chat_message(query)
+        
+        if success and response:
+            api_response = response
+        else:
+            api_response = f"Error communicating with API chat service: {error}"
+            logger.error(f"API chat error: {error}")
+    except Exception as e:
+        api_response = f"Error communicating with API chat service: {e}"
+        logger.error(f"API chat error: {e}")
+        service_status.record_error(e)
+    
+    # Send the response
+    await send_response(source_type, source_id, api_response, {
         "bot_token": response_token,
         "chat_id": chat_id,
         "chat_type": chat_type

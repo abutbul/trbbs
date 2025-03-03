@@ -102,7 +102,10 @@ async def find_all_matching_bot_rules(message_text, config, source_bot_token=Non
             try:
                 if re.match(pattern, text_to_match):
                     logger.info(f"Found matching rule in bot {bot_name}! Response type: {rule.get('response_type', 'unknown')}")
-                    matches.append((bot, rule))
+                    # Create a copy of the rule and add the original message
+                    rule_copy = rule.copy()
+                    rule_copy["original_message"] = message_text
+                    matches.append((bot, rule_copy))
             except Exception as e:
                 logger.error(f"Error matching regex '{pattern}': {e}")
     

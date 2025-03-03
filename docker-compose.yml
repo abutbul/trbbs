@@ -46,6 +46,10 @@ services:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - REDIS_PASSWORD=${REDIS_PASSWORD:-changeme}
+      - API_CHAT_URL=${API_CHAT_URL:-http://host.docker.internal:8000/message}
+      - API_TIMEOUT=90.0  # Increase to 90 seconds
+      - API_RETRIES=2
+      - API_RETRY_DELAY=1.0
     volumes:
       - ./bot_config.json:/app/bot_config.json:ro
     depends_on:
@@ -53,6 +57,12 @@ services:
     networks:
       - app-network
     restart: on-failure
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+      interval: 20s  # Increased from 10s to 20s
+      timeout: 10s   # Increased from 5s to 10s
+      retries: 2
+      start_period: 30s
 
 networks:
   app-network:

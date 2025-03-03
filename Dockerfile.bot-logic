@@ -16,7 +16,7 @@ COPY scripts/ /app/scripts/
 RUN chmod +x /app/scripts/*
 
 # Install dependencies directly
-RUN pip install --no-cache-dir redis requests aioredis python-telegram-bot httpx
+RUN pip install --no-cache-dir redis aioredis python-telegram-bot httpx
 
 # Set environment variables
 ENV PYTHONPATH=/app
