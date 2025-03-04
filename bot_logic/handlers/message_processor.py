@@ -145,11 +145,15 @@ async def handle_no_matches(bot_token, config, source_type, source_id, chat_id, 
             })
             logger.info(f"Sent default help message listing available commands")
         else:
-            await send_response(source_type, source_id, f"Sorry, I don't understand that command.", {
-                "bot_token": bot_token,
-                "chat_id": chat_id,
-                "chat_type": chat_type
-            })
-            logger.info(f"Sent generic 'don't understand' message")
+            # Only respond with "don't understand" message in DMs, not in channels
+            if chat_type.lower() == "dm" or chat_type.lower() == "private":
+                await send_response(source_type, source_id, f"Sorry, I don't understand that command.", {
+                    "bot_token": bot_token,
+                    "chat_id": chat_id,
+                    "chat_type": chat_type
+                })
+                logger.info(f"Sent generic 'don't understand' message")
+            else:
+                logger.info(f"Ignoring unrecognized command in {chat_type}")
     else:
         logger.info(f"No matching rule found and no bot token to generate default response")
