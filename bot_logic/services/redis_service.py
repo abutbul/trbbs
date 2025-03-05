@@ -10,6 +10,12 @@ logger = logging.getLogger(__name__)
 # Global Redis connection pool
 redis_pool = None
 
+# Redis lock keys constants
+USER_LOCK_PREFIX = "user_lock:"
+USER_LOCK_EXPIRY = 90  # seconds - should match or exceed API_TIMEOUT
+MESSAGE_CLAIM_PREFIX = "msg_claim:"
+MESSAGE_CLAIM_EXPIRY = 300  # 5 minutes
+
 async def get_redis_pool():
     """Get or create the Redis connection pool."""
     global redis_pool
@@ -122,3 +128,112 @@ async def close_pubsub(pubsub):
             await pubsub.close()
         except Exception as e:
             logger.error(f"Error closing Redis pubsub: {e}")
+
+async def try_claim_message(message_id, instance_id):
+    """
+    Try to claim a message for processing by this instance.
+    Returns True if the message was claimed successfully, False otherwise.
+    """
+    if not message_id:
+        return False
+        
+    redis_client = await get_redis()
+    if not redis_client:
+        return False
+    
+    claim_key = f"{MESSAGE_CLAIM_PREFIX}{message_id}"
+    
+    try:
+        # Try to set the key only if it doesn't exist (NX option)
+        result = await redis_client.set(
+            claim_key, 
+            instance_id,
+            nx=True,  # Only set if key doesn't exist
+            ex=MESSAGE_CLAIM_EXPIRY  # Auto-expire to prevent deadlocks
+        )
+        
+        if result:
+            logger.info(f"Claimed message {message_id} by instance {instance_id}")
+            return True
+        else:
+            # Check who holds the claim
+            claim_holder = await redis_client.get(claim_key)
+            logger.info(f"Message {message_id} already claimed by instance {claim_holder}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Error claiming message {message_id}: {e}")
+        return False
+
+async def try_lock_user(user_id, instance_id):
+    """
+    Try to acquire a lock for a user to prevent multiple instances
+    from processing messages from the same user simultaneously.
+    
+    Returns True if lock was acquired, False otherwise.
+    """
+    if not user_id:
+        return False
+        
+    redis_client = await get_redis()
+    if not redis_client:
+        return False
+    
+    lock_key = f"{USER_LOCK_PREFIX}{user_id}"
+    
+    try:
+        # Try to set the key only if it doesn't exist
+        result = await redis_client.set(
+            lock_key, 
+            instance_id,
+            nx=True,  # Only set if key doesn't exist
+            ex=USER_LOCK_EXPIRY  # Auto-expire to prevent deadlocks
+        )
+        
+        if result:
+            logger.info(f"Acquired lock for user {user_id} by instance {instance_id}")
+            return True
+        else:
+            # Check who holds the lock
+            lock_holder = await redis_client.get(lock_key)
+            logger.info(f"User {user_id} is locked by instance {lock_holder}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Error acquiring lock for user {user_id}: {e}")
+        return False
+
+async def release_user_lock(user_id, instance_id):
+    """
+    Release a user lock, but only if we own it.
+    """
+    if not user_id:
+        return False
+        
+    redis_client = await get_redis()
+    if not redis_client:
+        return False
+    
+    lock_key = f"{USER_LOCK_PREFIX}{user_id}"
+    
+    try:
+        # Check if we own the lock
+        lock_holder = await redis_client.get(lock_key)
+        
+        if lock_holder == instance_id:
+            # We own the lock, delete it
+            await redis_client.delete(lock_key)
+            logger.info(f"Released lock for user {user_id} by instance {instance_id}")
+            return True
+        elif lock_holder:
+            # Someone else owns the lock
+            logger.warning(f"Cannot release lock for user {user_id} - owned by {lock_holder}, not {instance_id}")
+            return False
+        else:
+            # Lock doesn't exist anymore
+            logger.info(f"Lock for user {user_id} already released")
+            return True
+            
+    except Exception as e:
+        logger.error(f"Error releasing lock for user {user_id}: {e}")
+        return False

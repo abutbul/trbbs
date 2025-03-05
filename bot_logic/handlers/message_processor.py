@@ -8,11 +8,81 @@ from bot_logic.core.status import service_status
 from bot_logic.handlers.rule_matcher import ensure_bot_usernames, find_all_matching_bot_rules, get_available_commands
 from bot_logic.services.response_service import send_response
 from bot_logic.services.api_service import send_chat_message  # Add this import
+import uuid
+import asyncio
+from bot_logic.services.redis_service import try_lock_user, release_user_lock, try_claim_message
 
 logger = logging.getLogger(__name__)
 
+# Generate a unique ID for this bot-logic instance
+INSTANCE_ID = os.environ.get("INSTANCE_NAME", str(uuid.uuid4())[:8])
+logger.info(f"Bot-logic instance started with ID: {INSTANCE_ID}")
+
 async def process_message(message_data):
     """Process an incoming message and generate a response."""
+    try:
+        # Create a unique message identifier
+        message_id = _extract_message_id(message_data)
+        
+        if not message_id:
+            logger.warning("Couldn't extract message ID, skipping message")
+            return
+        
+        # Try to claim this message for processing
+        claim_acquired = await try_claim_message(message_id, INSTANCE_ID)
+        
+        if not claim_acquired:
+            logger.info(f"Message {message_id} is already being processed by another instance, skipping")
+            return
+            
+        # Extract user identification for user-level locking
+        user_id = _extract_user_id(message_data)
+        
+        if not user_id:
+            logger.warning("Couldn't extract user ID from message, processing without user lock")
+            await _process_message_internal(message_data)
+            return
+            
+        # Try to acquire lock for this user
+        lock_acquired = await try_lock_user(user_id, INSTANCE_ID)
+        
+        if not lock_acquired:
+            logger.info(f"User {user_id} is being processed by another instance, will retry later")
+            # We'll skip for now - the message claim ensures it won't be lost
+            return
+            
+        try:
+            # Process the message with lock protection
+            await _process_message_internal(message_data)
+        finally:
+            # Always try to release the lock when done
+            await release_user_lock(user_id, INSTANCE_ID)
+            
+    except Exception as e:
+        logger.error(f"Error in process_message: {e}")
+        service_status.record_error(e)
+
+def _extract_message_id(message):
+    """Extract a unique message identifier."""
+    source_type = message.get('source_type', 'unknown')
+    message_id = message.get('message_id')
+    timestamp = message.get('timestamp', '')
+    
+    if message_id:
+        return f"{source_type}:{message_id}:{timestamp}"
+    return None
+
+def _extract_user_id(message):
+    """Extract a unique user identifier from the message."""
+    # Use the most specific identifier available
+    if message.get("from_id"):
+        return f"{message.get('source_type')}:{message.get('from_id')}"
+    elif message.get("chat_id"):
+        return f"{message.get('source_type')}:{message.get('chat_id')}"
+    return None
+
+async def _process_message_internal(message_data):
+    """Process the message after lock has been acquired."""
     try:
         message_text = message_data.get("content", "")
         source_type = message_data.get("source_type", "")

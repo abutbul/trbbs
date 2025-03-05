@@ -10,7 +10,7 @@ from bot_logic.core.status import service_status
 logger = logging.getLogger(__name__)
 
 # Configuration
-API_TIMEOUT = float(os.environ.get("API_TIMEOUT", "60.0"))  # Increase default to 60 seconds
+API_TIMEOUT = float(os.environ.get("API_TIMEOUT", "180.0"))  # Increase default to 60 seconds
 API_RETRIES = int(os.environ.get("API_RETRIES", "2"))
 API_RETRY_DELAY = float(os.environ.get("API_RETRY_DELAY", "1.0"))
 
