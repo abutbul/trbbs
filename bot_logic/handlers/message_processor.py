@@ -141,7 +141,9 @@ async def process_matching_rules(matches, source_type, source_id, chat_id, chat_
             })
         elif response_type == "script":
             # Execute script and return output
-            await execute_script_response(response_content, source_type, source_id, response_token, chat_id, chat_type)
+            # Pass the original message for argument extraction
+            original_message = rule.get("original_message", "")
+            await execute_script_response(response_content, source_type, source_id, response_token, chat_id, chat_type, original_message)
         elif response_type == "api-chat":
             # New type: API chat response
             # Use the original message for processing
@@ -150,11 +152,22 @@ async def process_matching_rules(matches, source_type, source_id, chat_id, chat_
         else:
             logger.error(f"Unknown response type: {response_type}")
 
-async def execute_script_response(script_command, source_type, source_id, response_token, chat_id, chat_type):
+async def execute_script_response(script_command, source_type, source_id, response_token, chat_id, chat_type, original_message=""):
     """Execute a script and send its output as a response."""
     try:
-        # Execute the script and capture the output
-        script_output = subprocess.check_output(script_command, shell=True, text=True)
+        # Extract command arguments from the original message
+        command_args = extract_command_args(original_message)
+        
+        # Append extracted arguments to the script command
+        if command_args:
+            full_command = f"{script_command} {command_args}"
+        else:
+            full_command = script_command
+            
+        logger.info(f"Executing script: {full_command}")
+        
+        # Execute the script with arguments and capture the output
+        script_output = subprocess.check_output(full_command, shell=True, text=True)
         script_response = f"Output from script: {script_output}"
     except subprocess.CalledProcessError as e:
         script_response = f"Error executing script: {e}"
@@ -165,6 +178,22 @@ async def execute_script_response(script_command, source_type, source_id, respon
         "chat_id": chat_id,
         "chat_type": chat_type
     })
+
+def extract_command_args(message):
+    """Extract command arguments from a message.
+    For example, from "/car 39438", extract "39438".
+    """
+    if not message:
+        return ""
+        
+    # Split by whitespace and remove empty items
+    parts = [part for part in message.strip().split() if part]
+    
+    if len(parts) <= 1:
+        return ""  # No arguments provided
+        
+    # Return everything after the command
+    return " ".join(parts[1:])
 
 async def execute_api_chat_response(message_content, source_type, source_id, response_token, chat_id, chat_type):
     """Send message to API chat service and return the response."""
