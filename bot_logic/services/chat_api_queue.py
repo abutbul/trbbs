@@ -2,14 +2,13 @@ import asyncio
 import json
 import logging
 import time
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Dict, Any, Optional, List, Tuple, Callable
 import uuid
 
 from bot_logic.services.redis_service import get_redis
 from bot_logic.services.api_service import send_chat_message
 from bot_logic.services.response_service import send_response
 from bot_logic.core.status import service_status
-from bot_logic.services.reaction_service import add_processing_reaction, update_to_completed_reaction, add_error_reaction
 
 logger = logging.getLogger(__name__)
 
@@ -27,10 +26,17 @@ QUEUE_ITEM_EXPIRY = 3600  # 1 hour max for queue items
 _worker_task = None
 _should_stop = False
 
+# Status constants
+STATUS_QUEUED = "queued"
+STATUS_PROCESSING = "processing"
+STATUS_COMPLETED = "completed"
+STATUS_ERROR = "error"
+
 class QueuedRequest:
     def __init__(self, request_id: str, user_id: str, message: str, 
                 source_type: str, source_id: str, response_token: str,
-                chat_id: str, chat_type: str, message_id: str = None):
+                chat_id: str, chat_type: str, message_id: str = None,
+                status_callback: Callable = None):
         self.request_id = request_id
         self.user_id = user_id
         self.message = message
@@ -41,6 +47,7 @@ class QueuedRequest:
         self.chat_type = chat_type
         self.message_id = message_id  # Store original message ID for reactions
         self.timestamp = time.time()
+        self.status_callback = status_callback  # Callback for status updates
         
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -52,8 +59,9 @@ class QueuedRequest:
             "response_token": self.response_token,
             "chat_id": self.chat_id,
             "chat_type": self.chat_type,
-            "message_id": self.message_id,  # Include message_id in serialization
+            "message_id": self.message_id,
             "timestamp": self.timestamp
+            # status_callback is not serializable, so we don't include it
         }
         
     @classmethod
@@ -67,17 +75,29 @@ class QueuedRequest:
             response_token=data.get("response_token", ""),
             chat_id=data.get("chat_id", ""),
             chat_type=data.get("chat_type", ""),
-            message_id=data.get("message_id", ""),  # Get message_id from data
+            message_id=data.get("message_id", ""),
         )
+
+    async def notify_status(self, status, response=None, error=None):
+        """Notify status callback if available"""
+        if self.status_callback:
+            try:
+                await self.status_callback(self, status, response, error)
+            except Exception as e:
+                logger.error(f"Error in status callback: {e}")
 
 
 async def enqueue_chat_request(user_id: str, message: str, 
                              source_type: str, source_id: str, 
                              response_token: str, chat_id: str, 
-                             chat_type: str, message_id: str) -> str:
+                             chat_type: str, message_id: str, 
+                             status_callback: Callable = None) -> str:
     """
     Add a chat request to the queue and return the request ID.
     If the user already has a request in the queue, update it.
+    
+    The status_callback, if provided, will be called with 
+    (request, status, response, error) when the request status changes.
     """
     redis = await get_redis()
     if not redis:
@@ -87,7 +107,7 @@ async def enqueue_chat_request(user_id: str, message: str,
     # Create a unique request ID
     request_id = str(uuid.uuid4())
     
-    # Create the request object with message_id
+    # Create the request object with message_id and status callback
     request = QueuedRequest(
         request_id=request_id,
         user_id=user_id,
@@ -97,22 +117,35 @@ async def enqueue_chat_request(user_id: str, message: str,
         response_token=response_token,
         chat_id=chat_id,
         chat_type=chat_type,
-        message_id=message_id  # Store message ID for reactions
+        message_id=message_id,
+        status_callback=status_callback
     )
     
     # First check if user already has a request in the queue
     # If so, we'll update it instead of adding a new one
     existing_requests = await redis.hgetall(CHAT_API_QUEUE_KEY)
     
+    # Track if we're updating an existing request
+    updating_existing = False
+    
     for req_id, req_data in existing_requests.items():
         try:
             req = json.loads(req_data)
             if req.get("user_id") == user_id:
-                # User already has a request, update it
-                logger.info(f"Updating existing chat request for user {user_id}")
-                request.request_id = req_id  # Keep the same request ID
-                await redis.hset(CHAT_API_QUEUE_KEY, req_id, json.dumps(request.to_dict()))
-                return req_id
+                # Check if this is a different message or the same message as before
+                if req.get("message_id") != message_id:
+                    # User already has a request, update it
+                    logger.info(f"Updating existing chat request for user {user_id}")
+                    request.request_id = req_id  # Keep the same request ID
+                    await redis.hset(CHAT_API_QUEUE_KEY, req_id, json.dumps(request.to_dict()))
+                    updating_existing = True
+                    # Notify about the update via callback
+                    await request.notify_status(STATUS_QUEUED)
+                    return req_id
+                else:
+                    # This is a duplicate request for the same message, ignore it
+                    logger.info(f"Ignoring duplicate chat request for same message_id: {message_id}")
+                    return req_id
         except Exception as e:
             logger.error(f"Error parsing existing request: {e}")
     
@@ -128,16 +161,9 @@ async def enqueue_chat_request(user_id: str, message: str,
         # Update stats
         await redis.hincrby(CHAT_API_STATS_KEY, "total_requests", 1)
         
-        # If this is the first in queue, add processing reaction
-        if position == 1:
-            # Add the processing reaction to the message
-            await add_processing_reaction(
-                source_type=source_type,
-                message_id=message_id,
-                bot_token=response_token,
-                chat_id=chat_id
-            )
-            
+        # Notify that request is queued
+        await request.notify_status(STATUS_QUEUED)
+        
         return request_id
     except Exception as e:
         logger.error(f"Error enqueueing chat request: {e}")
@@ -299,7 +325,10 @@ async def process_chat_api_queue():
             logger.info(f"Processing chat API request for user {next_request.user_id}")
             
             # Update status to "processing"
-            await update_request_status(next_request.request_id, "processing")
+            await update_request_status(next_request.request_id, STATUS_PROCESSING)
+            
+            # Notify that request is processing
+            await next_request.notify_status(STATUS_PROCESSING)
             
             # Actually process the request
             await process_chat_request(next_request)
@@ -399,15 +428,6 @@ async def remove_request(request_id: str) -> bool:
 async def process_chat_request(request: QueuedRequest):
     """Process a chat API request."""
     try:
-        # Add processing emoji to the original message if not already there
-        if request.message_id:
-            await add_processing_reaction(
-                source_type=request.source_type,
-                message_id=request.message_id,
-                bot_token=request.response_token,
-                chat_id=request.chat_id
-            )
-        
         # Make the actual API call
         logger.info(f"Sending request to chat API: {request.message[:100]}...")
         success, response, error = await send_chat_message(request.message)
@@ -415,18 +435,14 @@ async def process_chat_request(request: QueuedRequest):
         # Send the response back to the user
         if success and response:
             api_response = response
+            # Notify about successful completion
+            await request.notify_status(STATUS_COMPLETED, response)
         else:
             api_response = f"Error communicating with chat API: {error}"
             logger.error(f"Chat API error: {error}")
             
-            # Add error reaction if there was an API error
-            if request.message_id:
-                await add_error_reaction(
-                    source_type=request.source_type,
-                    message_id=request.message_id,
-                    bot_token=request.response_token,
-                    chat_id=request.chat_id
-                )
+            # Notify about error
+            await request.notify_status(STATUS_ERROR, None, error)
             
         # Send the response
         await send_response(
@@ -440,15 +456,6 @@ async def process_chat_request(request: QueuedRequest):
             }
         )
         
-        # Update reaction from processing to completed
-        if request.message_id:
-            await update_to_completed_reaction(
-                source_type=request.source_type,
-                message_id=request.message_id,
-                bot_token=request.response_token,
-                chat_id=request.chat_id
-            )
-        
         # Update stats
         redis = await get_redis()
         if redis:
@@ -458,14 +465,8 @@ async def process_chat_request(request: QueuedRequest):
         logger.error(f"Error processing chat request: {e}")
         service_status.record_error(e)
         
-        # Add error reaction
-        if request.message_id:
-            await add_error_reaction(
-                source_type=request.source_type,
-                message_id=request.message_id,
-                bot_token=request.response_token,
-                chat_id=request.chat_id
-            )
+        # Notify about error
+        await request.notify_status(STATUS_ERROR, None, str(e))
         
         # Send error response
         try:

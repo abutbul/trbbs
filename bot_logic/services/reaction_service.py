@@ -20,6 +20,16 @@ TELEGRAM_ALLOWED_REACTIONS = [
     "💊", "🙊", "😎", "👾", "🤷‍♂", "🤷", "🤷‍♀", "😡"
 ]
 
+# Add a lock for managing concurrent reactions to the same message
+from asyncio import Lock
+_reaction_locks = {}
+
+async def _get_message_lock(message_id):
+    """Get a lock specific to this message ID to prevent race conditions."""
+    if message_id not in _reaction_locks:
+        _reaction_locks[message_id] = Lock()
+    return _reaction_locks[message_id]
+
 async def add_reaction(source_type, message_id, emoji, bot_token, chat_id):
     """Add a reaction emoji to a message."""
     try:
@@ -147,12 +157,34 @@ async def update_reaction(source_type, message_id, old_emoji, new_emoji, bot_tok
 
 async def add_processing_reaction(source_type, message_id, bot_token, chat_id):
     """Add the processing emoji to a message."""
-    return await add_reaction(source_type, message_id, PROCESSING_EMOJI, bot_token, chat_id)
+    # Use a lock to prevent race conditions when multiple handlers try to add reactions
+    lock = await _get_message_lock(message_id)
+    async with lock:
+        logger.debug(f"Adding processing reaction to message {message_id}")
+        return await add_reaction(source_type, message_id, PROCESSING_EMOJI, bot_token, chat_id)
 
 async def update_to_completed_reaction(source_type, message_id, bot_token, chat_id):
     """Update from processing emoji to completed emoji."""
-    return await update_reaction(source_type, message_id, PROCESSING_EMOJI, COMPLETED_EMOJI, bot_token, chat_id)
+    # Use a lock to prevent race conditions
+    lock = await _get_message_lock(message_id)
+    async with lock:
+        logger.debug(f"Updating to completed reaction on message {message_id}")
+        return await update_reaction(source_type, message_id, PROCESSING_EMOJI, COMPLETED_EMOJI, bot_token, chat_id)
 
 async def add_error_reaction(source_type, message_id, bot_token, chat_id):
     """Add error emoji to a message."""
-    return await add_reaction(source_type, message_id, ERROR_EMOJI, bot_token, chat_id)
+    # Use a lock to prevent race conditions
+    lock = await _get_message_lock(message_id)
+    async with lock:
+        logger.debug(f"Adding error reaction to message {message_id}")
+        return await add_reaction(source_type, message_id, ERROR_EMOJI, bot_token, chat_id)
+
+# Clean up old locks periodically to prevent memory leaks
+async def cleanup_reaction_locks():
+    """Remove old reaction locks to prevent memory leaks."""
+    global _reaction_locks
+    old_locks = list(_reaction_locks.keys())
+    if len(old_locks) > 1000:  # If we have too many locks
+        logger.info(f"Cleaning up {len(old_locks) - 500} old reaction locks")
+        # Keep the most recent 500
+        _reaction_locks = {k: _reaction_locks[k] for k in old_locks[-500:]}

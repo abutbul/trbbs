@@ -5,9 +5,10 @@ import subprocess
 import httpx
 from bot_logic.core.config import load_bot_config
 from bot_logic.core.status import service_status
-from bot_logic.handlers.rule_matcher import ensure_bot_usernames, find_all_matching_bot_rules, get_available_commands
+from bot_logic.handlers.rule_matcher import ensure_bot_usernames, find_all_matching_bot_rules, get_available_commands, extract_numeric_id
 from bot_logic.services.response_service import send_response
 from bot_logic.services.api_service import send_chat_message
+from bot_logic.services.reaction_service import add_processing_reaction, update_to_completed_reaction, add_error_reaction
 import uuid
 import asyncio
 from bot_logic.services.redis_service import (
@@ -16,13 +17,15 @@ from bot_logic.services.redis_service import (
     get_queued_messages, remove_from_queue
 )
 from bot_logic.services.chat_api_queue import enqueue_chat_request, get_queue_position
-from bot_logic.services.reaction_service import add_processing_reaction
 
 logger = logging.getLogger(__name__)
 
 # Generate a unique ID for this bot-logic instance
 INSTANCE_ID = os.environ.get("INSTANCE_NAME", str(uuid.uuid4())[:8])
 logger.info(f"Bot-logic instance started with ID: {INSTANCE_ID}")
+
+# Track active requests to properly handle reactions for consecutive commands
+_active_requests = {}
 
 async def process_message(message_data):
     """Process an incoming message and generate a response."""
@@ -171,6 +174,9 @@ async def process_matching_rules(matches, source_type, source_id, chat_id, chat_
         
         logger.info(f"Generating response from bot {bot_name} with token ending ...{response_token[-5:] if response_token else 'none'}")
         
+        # Extract message_id for reaction management
+        message_id = original_message_data.get("message_id") if original_message_data else None
+        
         if response_type == "message":
             # Simple text response - include chat_id and chat_type
             await send_response(source_type, source_id, response_content, {
@@ -182,7 +188,10 @@ async def process_matching_rules(matches, source_type, source_id, chat_id, chat_
             # Execute script and return output
             # Pass the original message for argument extraction
             original_message = rule.get("original_message", "")
-            await execute_script_response(response_content, source_type, source_id, response_token, chat_id, chat_type, original_message)
+            await execute_script_response(
+                response_content, source_type, source_id, response_token, 
+                chat_id, chat_type, original_message, message_id
+            )
         elif response_type == "api-chat":
             # New type: API chat response
             # Use the original message for processing
@@ -192,9 +201,13 @@ async def process_matching_rules(matches, source_type, source_id, chat_id, chat_
         else:
             logger.error(f"Unknown response type: {response_type}")
 
-async def execute_script_response(script_command, source_type, source_id, response_token, chat_id, chat_type, original_message=""):
+async def execute_script_response(script_command, source_type, source_id, response_token, chat_id, chat_type, original_message="", message_id=None):
     """Execute a script and send its output as a response."""
     try:
+        # Add the processing reaction to show the script is running
+        if message_id:
+            await add_processing_reaction(source_type, message_id, response_token, chat_id)
+        
         # Extract command arguments from the original message
         command_args = extract_command_args(original_message)
         
@@ -209,10 +222,26 @@ async def execute_script_response(script_command, source_type, source_id, respon
         # Execute the script with arguments and capture the output
         script_output = subprocess.check_output(full_command, shell=True, text=True)
         script_response = f"Output from script: {script_output}"
+        
+        # Update to completed reaction now that script is done
+        if message_id:
+            await update_to_completed_reaction(source_type, message_id, response_token, chat_id)
     except subprocess.CalledProcessError as e:
         script_response = f"Error executing script: {e}"
         service_status.record_error(e)
+        
+        # Add error reaction if script failed
+        if message_id:
+            await add_error_reaction(source_type, message_id, response_token, chat_id)
+    except Exception as e:
+        script_response = f"Error: {e}"
+        service_status.record_error(e)
+        
+        # Add error reaction for any other exception
+        if message_id:
+            await add_error_reaction(source_type, message_id, response_token, chat_id)
     
+    # Send the response whether successful or not
     await send_response(source_type, source_id, script_response, {
         "bot_token": response_token,
         "chat_id": chat_id,
@@ -292,7 +321,7 @@ async def execute_api_chat_response(message_content, source_type, source_id, res
         # Log the message ID we're using (for debugging)
         logger.info(f"Using message ID for reactions: {original_message_id}")
             
-        # Enqueue the request with the message ID
+        # Enqueue the request with the message ID and status callback
         request_id = await enqueue_chat_request(
             user_id=user_id,
             message=query,
@@ -301,7 +330,8 @@ async def execute_api_chat_response(message_content, source_type, source_id, res
             response_token=response_token,
             chat_id=chat_id,
             chat_type=chat_type,
-            message_id=original_message_id  # Pass the message ID for reactions
+            message_id=original_message_id,  # Pass the message ID for reactions
+            status_callback=handle_request_status_change  # Pass our status callback
         )
         
         # If enqueuing failed
@@ -329,7 +359,7 @@ async def execute_api_chat_response(message_content, source_type, source_id, res
                     "chat_type": chat_type
                 }
             )
-        # For position 1, we add the reaction in the enqueue function
+        # For position 1, we add the reaction in the status callback
         
     except Exception as e:
         api_response = f"Error queuing request for API chat service: {e}"
@@ -372,3 +402,59 @@ async def handle_no_matches(bot_token, config, source_type, source_id, chat_id, 
                 logger.info(f"Ignoring unrecognized command in {chat_type}")
     else:
         logger.info(f"No matching rule found and no bot token to generate default response")
+
+async def handle_request_status_change(request, status, response=None, error=None):
+    """
+    Handle status changes for a chat API request.
+    This function manages reactions based on the request status.
+    """
+    source_type = request.source_type
+    message_id = request.message_id
+    bot_token = request.response_token
+    chat_id = request.chat_id
+    
+    # Create a request tracking key
+    request_key = f"{source_type}:{chat_id}:{message_id}"
+    
+    logger.info(f"Request {request.request_id} status changed to {status}")
+    
+    try:
+        if status == "queued":
+            # Add processing reaction for the first request in queue
+            position = await get_queue_position(request.request_id)
+            
+            # Track this request
+            _active_requests[request_key] = {
+                "status": "queued",
+                "request_id": request.request_id,
+                "position": position
+            }
+            
+            if position == 1:
+                await add_processing_reaction(source_type, message_id, bot_token, chat_id)
+                
+        elif status == "processing":
+            # Ensure processing reaction is added when processing starts
+            await add_processing_reaction(source_type, message_id, bot_token, chat_id)
+            
+            # Update tracking
+            if request_key in _active_requests:
+                _active_requests[request_key]["status"] = "processing"
+            
+        elif status == "completed":
+            # Update reaction from processing to completed
+            await update_to_completed_reaction(source_type, message_id, bot_token, chat_id)
+            
+            # Remove from tracking
+            _active_requests.pop(request_key, None)
+            
+        elif status == "error":
+            # Add error reaction
+            await add_error_reaction(source_type, message_id, bot_token, chat_id)
+            
+            # Remove from tracking
+            _active_requests.pop(request_key, None)
+    
+    except Exception as e:
+        logger.error(f"Error handling request status change: {e}")
+        service_status.record_error(e)
