@@ -3,6 +3,10 @@ import os
 import logging
 import asyncio
 import sys
+import time
+import signal
+import json
+from aiohttp import web
 
 # Configure logging
 logging.basicConfig(
@@ -19,62 +23,86 @@ from bot_logic.core.config import DEBUG_MODE
 from bot_logic.services.redis_service import initialize_redis, cleanup_redis
 from bot_logic.handlers.message_listener import message_listener
 
-async def main():
-    """Main entry point."""
-    try:
-        logger.info("Starting Bot Logic service...")
-        
-        # Initialize the Redis connection
-        redis = await initialize_redis()
-        if not redis:
-            logger.error("Failed to initialize Redis connection. Exiting...")
-            return False
-        
-        # Mark startup as complete
-        service_status.complete_startup()
-        logger.info("Bot Logic service started successfully")
-        
-        # Start message listener
-        await message_listener()
-        
-        return True
-    except KeyboardInterrupt:
-        logger.info("Program interrupted by user")
-    except Exception as e:
-        logger.error(f"Error in main function: {e}")
-        raise
-    finally:
-        # Clean up Redis connection when exiting
-        await cleanup_redis()
+# Create web app for health checks
+app = web.Application()
 
-async def run_with_shutdown_handling():
-    """Run the service with proper signal handling."""
-    import signal
-    loop = asyncio.get_running_loop()
+async def health_handler(request):
+    """Health check endpoint for the service."""
+    # Get status information
+    status = service_status.get_status()
     
-    # Set up signal handlers for graceful shutdown
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, lambda: asyncio.create_task(cleanup_redis()))
+    # Determine overall health
+    status['healthy'] = status.get('redis_connected', False)
+    
+    if status['healthy']:
+        return web.json_response(status)
+    else:
+        return web.json_response(status, status=503)  # Service Unavailable
+
+# Register routes
+app.router.add_get('/health', health_handler)
+
+async def start_web_server():
+    """Start the health check web server."""
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', 8081)
+    await site.start()
+    logger.info("Health check server started on http://0.0.0.0:8081")
+    return runner
+
+async def cleanup(runner, listener_task):
+    """Clean up resources before shutdown."""
+    if runner:
+        await runner.cleanup()
+    
+    if listener_task:
+        listener_task.cancel()
+        try:
+            await listener_task
+        except asyncio.CancelledError:
+            pass
+    
+    await cleanup_redis()
+    logger.info("Cleanup completed")
+
+async def main():
+    """Main entry point of the service."""
+    instance_name = os.environ.get("INSTANCE_NAME", "bot-logic-unknown")
+    logger.info(f"Starting bot logic service [{instance_name}]")
+    
+    # Initialize Redis
+    if not await initialize_redis():
+        logger.critical("Failed to connect to Redis, exiting")
+        return 1
+    
+    # Start the web server for health checks
+    web_runner = await start_web_server()
+    
+    # Start message listener
+    listener = asyncio.create_task(message_listener())
+    
+    # Wait for shutdown signal
+    shutdown = asyncio.Future()
+    
+    # Set up signal handlers
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, lambda: shutdown.set_result(None))
     
     try:
-        success = await main()
-        if not success:
-            logger.error("Service initialization failed")
-            return
-    except asyncio.CancelledError:
-        logger.info("Main task cancelled")
+        await shutdown
+        logger.info("Shutdown signal received")
     finally:
-        await cleanup_redis()
+        await cleanup(web_runner, listener)
+    
+    return 0
 
 if __name__ == "__main__":
     try:
-        if DEBUG_MODE:
-            logger.info("Running in DEBUG mode")
-        
-        # Use asyncio.run to properly manage the event loop
-        asyncio.run(run_with_shutdown_handling())
-    except KeyboardInterrupt:
-        logger.info("Service stopped by user")
+        exit_code = asyncio.run(main())
     except Exception as e:
-        logger.error(f"Fatal error: {e}")
-        exit(1)
+        logger.critical(f"Unhandled exception: {e}")
+        exit_code = 1
+    finally:
+        logger.info(f"Bot logic service shutting down with exit code {exit_code}")

@@ -2,15 +2,19 @@ import os
 import json
 import logging
 import subprocess
-import httpx  # Add this import
+import httpx
 from bot_logic.core.config import load_bot_config
 from bot_logic.core.status import service_status
 from bot_logic.handlers.rule_matcher import ensure_bot_usernames, find_all_matching_bot_rules, get_available_commands
 from bot_logic.services.response_service import send_response
-from bot_logic.services.api_service import send_chat_message  # Add this import
+from bot_logic.services.api_service import send_chat_message
 import uuid
 import asyncio
-from bot_logic.services.redis_service import try_lock_user, release_user_lock, try_claim_message
+from bot_logic.services.redis_service import (
+    try_lock_user, release_user_lock, try_claim_message, 
+    store_active_command, get_active_command, queue_message,
+    get_queued_messages, remove_from_queue
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,13 +51,46 @@ async def process_message(message_data):
         lock_acquired = await try_lock_user(user_id, INSTANCE_ID)
         
         if not lock_acquired:
-            logger.info(f"User {user_id} is being processed by another instance, will retry later")
-            # We'll skip for now - the message claim ensures it won't be lost
-            return
+            # User is being processed by another instance
+            # Check if this message is the same as the active command
+            active_cmd = await get_active_command(user_id)
+            current_content = message_data.get("content", "").strip()
+            
+            if active_cmd and active_cmd.get("content") == current_content:
+                # This is a duplicate command, ignore it
+                logger.info(f"Duplicate command from user {user_id}, ignoring: {current_content[:50]}...")
+                return
+            else:
+                # This is a different command, queue it for later processing
+                logger.info(f"User {user_id} is busy, queuing different command: {current_content[:50]}...")
+                await queue_message(user_id, message_data)
+                return
             
         try:
+            # Store this as the active command for the user
+            await store_active_command(user_id, INSTANCE_ID, message_data)
+            
             # Process the message with lock protection
             await _process_message_internal(message_data)
+            
+            # After processing current message, check if there are queued messages
+            queued_messages = await get_queued_messages(user_id, max_count=1)
+            if queued_messages:
+                # Log that we found queued messages
+                logger.info(f"Found {len(queued_messages)} queued messages for user {user_id}")
+                
+                # We'll process just one message to avoid prolonged lock holding
+                next_message = queued_messages[0]
+                
+                # Remove it from the queue
+                await remove_from_queue(user_id, next_message)
+                
+                # Update the active command
+                await store_active_command(user_id, INSTANCE_ID, next_message)
+                
+                # Process the next message
+                logger.info(f"Processing queued message for user {user_id}: {next_message.get('content', '')[:50]}...")
+                await _process_message_internal(next_message)
         finally:
             # Always try to release the lock when done
             await release_user_lock(user_id, INSTANCE_ID)

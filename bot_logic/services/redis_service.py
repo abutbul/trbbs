@@ -15,12 +15,14 @@ USER_LOCK_PREFIX = "user_lock:"
 USER_LOCK_EXPIRY = 90  # seconds - should match or exceed API_TIMEOUT
 MESSAGE_CLAIM_PREFIX = "msg_claim:"
 MESSAGE_CLAIM_EXPIRY = 300  # 5 minutes
+USER_ACTIVE_CMD_PREFIX = "user_active_cmd:"  # Track user's active command
+USER_CMD_QUEUE_PREFIX = "user_cmd_queue:"    # Queue for user's pending messages
 
 async def get_redis_pool():
     """Get or create the Redis connection pool."""
     global redis_pool
     
-    if redis_pool is None:
+    if (redis_pool is None):
         logger.info(f"Creating Redis connection pool to {REDIS_URL.replace('redis://:', 'redis://***:')}")
         redis_pool = aioredis.ConnectionPool.from_url(
             REDIS_URL,
@@ -223,6 +225,10 @@ async def release_user_lock(user_id, instance_id):
         if lock_holder == instance_id:
             # We own the lock, delete it
             await redis_client.delete(lock_key)
+            
+            # Clear active command
+            await clear_active_command(user_id)
+            
             logger.info(f"Released lock for user {user_id} by instance {instance_id}")
             return True
         elif lock_holder:
@@ -231,9 +237,176 @@ async def release_user_lock(user_id, instance_id):
             return False
         else:
             # Lock doesn't exist anymore
+            # Still clear active command just in case
+            await clear_active_command(user_id)
+            
             logger.info(f"Lock for user {user_id} already released")
             return True
             
     except Exception as e:
         logger.error(f"Error releasing lock for user {user_id}: {e}")
+        return False
+
+async def store_active_command(user_id, instance_id, message_data):
+    """
+    Store the command currently being processed for a user
+    """
+    if not user_id or not message_data:
+        return False
+        
+    redis_client = await get_redis()
+    if not redis_client:
+        return False
+    
+    key = f"{USER_ACTIVE_CMD_PREFIX}{user_id}"
+    
+    try:
+        # Store the message content and ID
+        data = {
+            "content": message_data.get("content", ""),
+            "message_id": message_data.get("message_id", ""),
+            "instance_id": instance_id,
+            "timestamp": message_data.get("timestamp", "")
+        }
+        
+        # Set with the same expiry as user locks
+        await redis_client.set(
+            key,
+            json.dumps(data),
+            ex=USER_LOCK_EXPIRY
+        )
+        logger.info(f"Stored active command for user {user_id}: {data['content'][:50]}...")
+        return True
+    except Exception as e:
+        logger.error(f"Error storing active command for user {user_id}: {e}")
+        return False
+
+async def get_active_command(user_id):
+    """
+    Get the command currently being processed for a user
+    """
+    if not user_id:
+        return None
+        
+    redis_client = await get_redis()
+    if not redis_client:
+        return None
+    
+    key = f"{USER_ACTIVE_CMD_PREFIX}{user_id}"
+    
+    try:
+        data = await redis_client.get(key)
+        if not data:
+            return None
+        
+        return json.loads(data)
+    except Exception as e:
+        logger.error(f"Error getting active command for user {user_id}: {e}")
+        return None
+
+async def clear_active_command(user_id):
+    """
+    Clear the active command for a user
+    """
+    if not user_id:
+        return False
+        
+    redis_client = await get_redis()
+    if not redis_client:
+        return False
+    
+    key = f"{USER_ACTIVE_CMD_PREFIX}{user_id}"
+    
+    try:
+        await redis_client.delete(key)
+        logger.info(f"Cleared active command for user {user_id}")
+        return True
+    except Exception as e:
+        logger.error(f"Error clearing active command for user {user_id}: {e}")
+        return False
+
+async def queue_message(user_id, message_data):
+    """
+    Queue a message for later processing when the user is no longer locked
+    """
+    if not user_id or not message_data:
+        return False
+        
+    redis_client = await get_redis()
+    if not redis_client:
+        return False
+    
+    key = f"{USER_CMD_QUEUE_PREFIX}{user_id}"
+    
+    try:
+        # Add message to queue with timestamp as score for ordering
+        timestamp = float(message_data.get("timestamp", asyncio.get_event_loop().time()))
+        
+        # Convert message_data to JSON string
+        message_json = json.dumps(message_data)
+        
+        # Add to sorted set
+        await redis_client.zadd(key, {message_json: timestamp})
+        
+        # Set expiry on the queue to prevent orphaned queues
+        await redis_client.expire(key, 3600)  # 1 hour expiry
+        
+        logger.info(f"Queued message for user {user_id}: {message_data.get('content', '')[:50]}...")
+        return True
+    except Exception as e:
+        logger.error(f"Error queuing message for user {user_id}: {e}")
+        return False
+
+async def get_queued_messages(user_id, max_count=5):
+    """
+    Get queued messages for a user, oldest first
+    """
+    if not user_id:
+        return []
+        
+    redis_client = await get_redis()
+    if not redis_client:
+        return []
+    
+    key = f"{USER_CMD_QUEUE_PREFIX}{user_id}"
+    
+    try:
+        # Get oldest messages first (lowest scores)
+        result = await redis_client.zrange(key, 0, max_count-1, withscores=False)
+        
+        messages = []
+        for msg_json in result:
+            try:
+                messages.append(json.loads(msg_json))
+            except json.JSONDecodeError:
+                logger.error(f"Invalid JSON in queued message for user {user_id}")
+        
+        return messages
+    except Exception as e:
+        logger.error(f"Error getting queued messages for user {user_id}: {e}")
+        return []
+
+async def remove_from_queue(user_id, message_data):
+    """
+    Remove a specific message from the user's queue
+    """
+    if not user_id or not message_data:
+        return False
+        
+    redis_client = await get_redis()
+    if not redis_client:
+        return False
+    
+    key = f"{USER_CMD_QUEUE_PREFIX}{user_id}"
+    
+    try:
+        # Convert message_data to JSON string
+        message_json = json.dumps(message_data)
+        
+        # Remove from sorted set
+        await redis_client.zrem(key, message_json)
+        logger.info(f"Removed message from queue for user {user_id}")
+        return True
+    except Exception as e:
+        logger.error(f"Error removing message from queue for user {user_id}: {e}")
         return False
