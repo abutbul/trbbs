@@ -15,6 +15,8 @@ from bot_logic.services.redis_service import (
     store_active_command, get_active_command, queue_message,
     get_queued_messages, remove_from_queue
 )
+from bot_logic.services.chat_api_queue import enqueue_chat_request, get_queue_position
+from bot_logic.services.reaction_service import add_processing_reaction
 
 logger = logging.getLogger(__name__)
 
@@ -146,8 +148,8 @@ async def _process_message_internal(message_data):
         matches = await find_all_matching_bot_rules(message_text, config, bot_token, chat_type)
         
         if matches:
-            # Process all matching rules
-            await process_matching_rules(matches, source_type, source_id, chat_id, chat_type)
+            # Process all matching rules - PASS the complete message_data
+            await process_matching_rules(matches, source_type, source_id, chat_id, chat_type, message_data)
         else:
             # No rule matched, but we know which bot received the message
             # Generate a default helpful response
@@ -157,7 +159,7 @@ async def _process_message_internal(message_data):
         logger.error(f"Error processing message: {e}")
         service_status.record_error(e)
 
-async def process_matching_rules(matches, source_type, source_id, chat_id, chat_type):
+async def process_matching_rules(matches, source_type, source_id, chat_id, chat_type, original_message_data=None):
     """Process all matching rules and generate responses."""
     for bot, rule in matches:
         response_type = rule.get("response_type", "")
@@ -185,7 +187,8 @@ async def process_matching_rules(matches, source_type, source_id, chat_id, chat_
             # New type: API chat response
             # Use the original message for processing
             original_message = rule.get("original_message", "")
-            await execute_api_chat_response(original_message, source_type, source_id, response_token, chat_id, chat_type)
+            # IMPORTANT: Pass the complete original message data to have access to message_id
+            await execute_api_chat_response(original_message, source_type, source_id, response_token, chat_id, chat_type, original_message_data)
         else:
             logger.error(f"Unknown response type: {response_type}")
 
@@ -232,37 +235,113 @@ def extract_command_args(message):
     # Return everything after the command
     return " ".join(parts[1:])
 
-async def execute_api_chat_response(message_content, source_type, source_id, response_token, chat_id, chat_type):
+# Update the function signature to accept the original_message_data parameter
+async def execute_api_chat_response(message_content, source_type, source_id, response_token, chat_id, chat_type, original_message_data=None):
     """Send message to API chat service and return the response."""
     try:
         # Extract the message content (everything after "bot:")
-        if message_content.lower().startswith("bot:"):
+        if isinstance(message_content, str) and message_content.lower().startswith("bot:"):
             query = message_content[4:].strip()  # Remove 'bot:' and trim spaces
-        else:
+        elif isinstance(message_content, str):
             query = message_content.strip()
+        else:
+            query = ""
             
         # Log the query being sent to the API
         logger.info(f"Sending request to API chat: {query[:100]}...")
         
-        # Use the API service without sending an interim message
-        success, response, error = await send_chat_message(query)
+        # Create a user_id for queue tracking
+        user_id = f"{source_type}:{source_id}"
         
-        if success and response:
-            api_response = response
-        else:
-            api_response = f"Error communicating with API chat service: {error}"
-            logger.error(f"API chat error: {error}")
+        # Extract the original message ID using the complete message_data object
+        original_message_id = None
+        
+        # First try to get directly from the original_message_data
+        if original_message_data and isinstance(original_message_data, dict):
+            original_message_id = original_message_data.get("message_id")
+            
+            # If not found, try numeric ID
+            if not original_message_id and "id" in original_message_data:
+                original_message_id = original_message_data.get("id")
+                
+            logger.debug(f"Found message ID in original_message_data: {original_message_id}")
+        
+        # If we still don't have it, try to get from the message content (backward compatibility)
+        if not original_message_id:
+            # Try to get from message_content if it's an object
+            for key in ["message_id", "id"]:
+                if hasattr(message_content, '__dict__') and key in message_content.__dict__:
+                    original_message_id = getattr(message_content, key)
+                    break
+            
+            # If message_content is a dict, try to get from there
+            if not original_message_id and isinstance(message_content, dict):
+                for key in ["message_id", "id"]:
+                    if key in message_content:
+                        original_message_id = message_content[key]
+                        break
+        
+        # If we still don't have it, generate a fallback ID
+        if not original_message_id:
+            logger.warning("Could not extract original message ID for reactions")
+            # Use a hash of the message content and user ID as a fallback
+            import hashlib
+            hash_input = f"{user_id}:{query}:{chat_id}"
+            original_message_id = hashlib.md5(hash_input.encode()).hexdigest()
+            
+        # Log the message ID we're using (for debugging)
+        logger.info(f"Using message ID for reactions: {original_message_id}")
+            
+        # Enqueue the request with the message ID
+        request_id = await enqueue_chat_request(
+            user_id=user_id,
+            message=query,
+            source_type=source_type,
+            source_id=source_id,
+            response_token=response_token,
+            chat_id=chat_id,
+            chat_type=chat_type,
+            message_id=original_message_id  # Pass the message ID for reactions
+        )
+        
+        # If enqueuing failed
+        if not request_id:
+            await send_response(source_type, source_id, 
+                "Sorry, I couldn't process your request right now. Please try again later.",
+                {
+                    "bot_token": response_token,
+                    "chat_id": chat_id,
+                    "chat_type": chat_type
+                }
+            )
+            return
+        
+        # Get queue position
+        position = await get_queue_position(request_id)
+        
+        # Send queue position information only if not first in line
+        if position > 1:
+            await send_response(source_type, source_id, 
+                f"Your request has been queued. You are position #{position} in line. I'll notify you when it's your turn.",
+                {
+                    "bot_token": response_token,
+                    "chat_id": chat_id,
+                    "chat_type": chat_type
+                }
+            )
+        # For position 1, we add the reaction in the enqueue function
+        
     except Exception as e:
-        api_response = f"Error communicating with API chat service: {e}"
-        logger.error(f"API chat error: {e}")
+        api_response = f"Error queuing request for API chat service: {e}"
+        logger.error(f"API chat queue error: {e}")
         service_status.record_error(e)
-    
-    # Send the response
-    await send_response(source_type, source_id, api_response, {
-        "bot_token": response_token,
-        "chat_id": chat_id,
-        "chat_type": chat_type
-    })
+        
+        # Send error response
+        await send_response(source_type, source_id, api_response, {
+            "bot_token": response_token,
+            "chat_id": chat_id,
+            "chat_type": chat_type
+        })
 
 async def handle_no_matches(bot_token, config, source_type, source_id, chat_id, chat_type):
     """Handle the case when no rules match the message."""

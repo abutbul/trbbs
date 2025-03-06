@@ -109,6 +109,13 @@ async def find_all_matching_bot_rules(message_text, config, source_bot_token=Non
             except Exception as e:
                 logger.error(f"Error matching regex '{pattern}': {e}")
     
+    # For each match, add the original message to the rule data
+    for i in range(len(matches)):
+        bot, rule = matches[i]
+        rule["original_message"] = message_text
+        # Ensure we keep the matched rule together with its bot
+        matches[i] = (bot, rule)
+    
     logger.info(f"Found {len(matches)} matching bot rules")
     return matches
 
@@ -129,3 +136,24 @@ async def get_available_commands(bot_token, config):
                     available_commands.append(cmd)
     
     return bot_name, available_commands
+
+# Add this function to extract numeric message ID from the message format
+def extract_numeric_id(message_id):
+    """
+    Extract a numeric ID from a message ID string.
+    This helps with Telegram reactions which require numeric IDs.
+    """
+    if not message_id:
+        return None
+        
+    # If it's already a number, return it
+    if isinstance(message_id, int) or (isinstance(message_id, str) and message_id.isdigit()):
+        return message_id
+    
+    # Try to extract numeric part
+    import re
+    match = re.search(r'(\d+)', str(message_id))
+    if match:
+        return match.group(1)
+        
+    return message_id  # Return as is if no numeric part found

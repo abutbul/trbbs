@@ -22,6 +22,9 @@ from bot_logic.core.status import service_status
 from bot_logic.core.config import DEBUG_MODE
 from bot_logic.services.redis_service import initialize_redis, cleanup_redis
 from bot_logic.handlers.message_listener import message_listener
+from bot_logic.services.chat_api_queue import start_queue_processor, stop_queue_processor
+# Import the new reaction handler
+from bot_logic.services.reaction_handler import start_reaction_handler, stop_reaction_handler
 
 # Create web app for health checks
 app = web.Application()
@@ -66,6 +69,12 @@ async def cleanup(runner, listener_task):
     await cleanup_redis()
     logger.info("Cleanup completed")
 
+# Flag to track if we should shut down
+should_shutdown = False
+
+# Get environment variable for queue worker
+ENABLE_QUEUE_WORKER = os.environ.get("ENABLE_QUEUE_WORKER", "true").lower() == "true"
+
 async def main():
     """Main entry point of the service."""
     instance_name = os.environ.get("INSTANCE_NAME", "bot-logic-unknown")
@@ -78,6 +87,16 @@ async def main():
     
     # Start the web server for health checks
     web_runner = await start_web_server()
+    
+    # Only start the queue processor if enabled for this instance
+    if ENABLE_QUEUE_WORKER:
+        logger.info("Starting chat API queue processor for this instance")
+        await start_queue_processor()
+    else:
+        logger.info("Chat API queue processor not enabled for this instance")
+    
+    # Start reaction handler (new!)
+    await start_reaction_handler()
     
     # Start message listener
     listener = asyncio.create_task(message_listener())
@@ -95,8 +114,25 @@ async def main():
         logger.info("Shutdown signal received")
     finally:
         await cleanup(web_runner, listener)
+        
+        # Stop queue processor if it was enabled
+        if ENABLE_QUEUE_WORKER:
+            await stop_queue_processor()
+        
+        # Stop the reaction handler (new!)
+        await stop_reaction_handler()
     
     return 0
+
+def signal_handler():
+    """Handle termination signals."""
+    global should_shutdown
+    logger.info("Received termination signal, shutting down...")
+    should_shutdown = True
+
+# Register signal handlers for graceful shutdown
+for sig in (signal.SIGINT, signal.SIGTERM):
+    signal.signal(sig, lambda signum, frame: signal_handler())
 
 if __name__ == "__main__":
     try:

@@ -24,8 +24,12 @@ services:
       - REDIS_PORT=6379
       - REDIS_PASSWORD=${REDIS_PASSWORD:-changeme}
       - BOT_CONFIG_PATH=/app/bot_config.json
+      - ENABLE_REACTIONS=true  # Make sure this is explicitly set to true
+      - LOG_LEVEL=DEBUG        # Set to DEBUG for more verbose logging
+      - PYTHONUNBUFFERED=1     # Ensure logs are output immediately
     volumes:
       - ./bot_config.json:/app/bot_config.json:ro
+      - ./scripts:/app/scripts:ro  # Mount scripts directory for debugging
     depends_on:
       - redis
     networks:
@@ -38,12 +42,43 @@ services:
       retries: 2
       start_period: 30s
 
+  # Main bot logic workers - one designated as chat-api queue processor
+  bot-logic-primary:
+    build:
+      context: .
+      dockerfile: Dockerfile.bot-logic
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-changeme}
+      - API_CHAT_URL=${API_CHAT_URL:-http://host.docker.internal:8000/message}
+      - API_TIMEOUT=190.0
+      - API_RETRIES=2
+      - API_RETRY_DELAY=1.0
+      - INSTANCE_NAME=bot-logic-primary
+      - ENABLE_QUEUE_WORKER=true  # This instance will run the queue processor
+      - MAX_CONCURRENT_CHAT_REQUESTS=${MAX_CONCURRENT_CHAT_REQUESTS:-1}
+    volumes:
+      - ./bot_config.json:/app/bot_config.json:ro
+    depends_on:
+      - redis
+    networks:
+      - app-network
+    restart: on-failure
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+      interval: 20s
+      timeout: 10s
+      retries: 2
+      start_period: 30s
+
+  # Additional workers that don't process the chat queue
   bot-logic:
     build:
       context: .
       dockerfile: Dockerfile.bot-logic
     deploy:
-      replicas: 3
+      replicas: 2  # Adjust the number of additional workers as needed
     environment:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
@@ -53,6 +88,7 @@ services:
       - API_RETRIES=2
       - API_RETRY_DELAY=1.0
       - INSTANCE_NAME=bot-logic-${REPLICA_ID:-0}
+      - ENABLE_QUEUE_WORKER=false  # These instances will NOT run the queue processor
     volumes:
       - ./bot_config.json:/app/bot_config.json:ro
     depends_on:

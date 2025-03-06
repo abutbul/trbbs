@@ -10,6 +10,8 @@ from telegram_bot.handlers.response_handler import response_listener
 from telegram_bot.services.telegram_service import initialize_bots, shutdown_bots
 
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("aiohttp").setLevel(logging.WARNING)
 
 # Track running tasks
 health_task = None
