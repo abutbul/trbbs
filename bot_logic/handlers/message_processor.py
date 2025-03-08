@@ -8,7 +8,7 @@ from bot_logic.core.status import service_status
 from bot_logic.handlers.rule_matcher import ensure_bot_usernames, find_all_matching_bot_rules, get_available_commands, extract_numeric_id
 from bot_logic.services.response_service import send_response
 from bot_logic.services.api_service import send_chat_message
-from bot_logic.services.reaction_service import add_processing_reaction, update_to_completed_reaction, add_error_reaction
+from bot_logic.services.reaction_service import add_processing_reaction, update_to_completed_reaction, add_error_reaction, add_reaction
 import uuid
 import asyncio
 from bot_logic.services.redis_service import (
@@ -264,7 +264,6 @@ def extract_command_args(message):
     # Return everything after the command
     return " ".join(parts[1:])
 
-# Update the function signature to accept the original_message_data parameter
 async def execute_api_chat_response(message_content, source_type, source_id, response_token, chat_id, chat_type, original_message_data=None):
     """Send message to API chat service and return the response."""
     try:
@@ -351,14 +350,8 @@ async def execute_api_chat_response(message_content, source_type, source_id, res
         
         # Send queue position information only if not first in line
         if position > 1:
-            await send_response(source_type, source_id, 
-                f"Your request has been queued. You are position #{position} in line. I'll notify you when it's your turn.",
-                {
-                    "bot_token": response_token,
-                    "chat_id": chat_id,
-                    "chat_type": chat_type
-                }
-            )
+            # Add dove reaction instead of sending message
+            await add_reaction(source_type, original_message_id, "🕊", response_token, chat_id)
         # For position 1, we add the reaction in the status callback
         
     except Exception as e:
@@ -415,7 +408,6 @@ async def handle_request_status_change(request, status, response=None, error=Non
     
     # Create a request tracking key
     request_key = f"{source_type}:{chat_id}:{message_id}"
-    
     logger.info(f"Request {request.request_id} status changed to {status}")
     
     try:

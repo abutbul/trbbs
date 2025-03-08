@@ -9,6 +9,7 @@ from bot_logic.services.redis_service import get_redis
 from bot_logic.services.api_service import send_chat_message
 from bot_logic.services.response_service import send_response
 from bot_logic.core.status import service_status
+from bot_logic.services.reaction_service import update_to_completed_reaction
 
 logger = logging.getLogger(__name__)
 
@@ -437,6 +438,7 @@ async def process_chat_request(request: QueuedRequest):
             api_response = response
             # Notify about successful completion
             await request.notify_status(STATUS_COMPLETED, response)
+            await update_to_completed_reaction(request.source_type, request.message_id, request.response_token, request.chat_id)
         else:
             api_response = f"Error communicating with chat API: {error}"
             logger.error(f"Chat API error: {error}")
