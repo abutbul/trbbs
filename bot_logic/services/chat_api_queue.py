@@ -4,16 +4,18 @@ import logging
 import time
 from typing import Dict, Any, Optional, List, Tuple, Callable
 import uuid
+import hashlib
 
 from bot_logic.services.redis_service import get_redis
 from bot_logic.services.api_service import send_chat_message
 from bot_logic.services.response_service import send_response
 from bot_logic.core.status import service_status
 from bot_logic.services.reaction_service import update_to_completed_reaction
+from bot_logic.services.redis_queue_manager import RedisQueueManager, STATUS_QUEUED, STATUS_PROCESSING, STATUS_COMPLETED, STATUS_ERROR
 
 logger = logging.getLogger(__name__)
 
-# Redis keys
+# Redis keys (kept for backward compatibility)
 CHAT_API_LOCK_KEY = "chat_api:lock"
 CHAT_API_QUEUE_KEY = "chat_api:queue"
 CHAT_API_STATUS_KEY = "chat_api:status"
@@ -27,13 +29,25 @@ QUEUE_ITEM_EXPIRY = 3600  # 1 hour max for queue items
 _worker_task = None
 _should_stop = False
 
-# Status constants
-STATUS_QUEUED = "queued"
-STATUS_PROCESSING = "processing"
-STATUS_COMPLETED = "completed"
-STATUS_ERROR = "error"
+# Initialize the Redis Queue Manager
+_queue_manager = RedisQueueManager(
+    prefix="chat_api",
+    default_ttl=QUEUE_ITEM_EXPIRY
+)
+
+# Configure the queue manager
+_queue_manager.lock_expiry = LOCK_EXPIRY
+_queue_manager.max_retries = 3
+_queue_manager.retry_delay_base = 5  # 5 seconds base delay
+
+# In-memory storage for callbacks
+_callbacks = {}
 
 class QueuedRequest:
+    """
+    Represents a queued chat API request.
+    Maintained for backward compatibility.
+    """
     def __init__(self, request_id: str, user_id: str, message: str, 
                 source_type: str, source_id: str, response_token: str,
                 chat_id: str, chat_type: str, message_id: str = None,
@@ -89,10 +103,10 @@ class QueuedRequest:
 
 
 async def enqueue_chat_request(user_id: str, message: str, 
-                             source_type: str, source_id: str, 
-                             response_token: str, chat_id: str, 
-                             chat_type: str, message_id: str, 
-                             status_callback: Callable = None) -> str:
+                              source_type: str, source_id: str, 
+                              response_token: str, chat_id: str, 
+                              chat_type: str, message_id: str, 
+                              status_callback: Callable = None) -> str:
     """
     Add a chat request to the queue and return the request ID.
     If the user already has a request in the queue, update it.
@@ -100,103 +114,61 @@ async def enqueue_chat_request(user_id: str, message: str,
     The status_callback, if provided, will be called with 
     (request, status, response, error) when the request status changes.
     """
-    redis = await get_redis()
-    if not redis:
-        logger.error("Failed to get Redis connection for enqueueing chat request")
-        return None
-        
-    # Create a unique request ID
-    request_id = str(uuid.uuid4())
-    
-    # Create the request object with message_id and status callback
-    request = QueuedRequest(
-        request_id=request_id,
-        user_id=user_id,
-        message=message,
-        source_type=source_type,
-        source_id=source_id,
-        response_token=response_token,
-        chat_id=chat_id,
-        chat_type=chat_type,
-        message_id=message_id,
-        status_callback=status_callback
-    )
-    
-    # First check if user already has a request in the queue
-    # If so, we'll update it instead of adding a new one
-    existing_requests = await redis.hgetall(CHAT_API_QUEUE_KEY)
-    
-    # Track if we're updating an existing request
-    updating_existing = False
-    
-    for req_id, req_data in existing_requests.items():
-        try:
-            req = json.loads(req_data)
-            if req.get("user_id") == user_id:
-                # Check if this is a different message or the same message as before
-                if req.get("message_id") != message_id:
-                    # User already has a request, update it
-                    logger.info(f"Updating existing chat request for user {user_id}")
-                    request.request_id = req_id  # Keep the same request ID
-                    await redis.hset(CHAT_API_QUEUE_KEY, req_id, json.dumps(request.to_dict()))
-                    updating_existing = True
-                    # Notify about the update via callback
-                    await request.notify_status(STATUS_QUEUED)
-                    return req_id
-                else:
-                    # This is a duplicate request for the same message, ignore it
-                    logger.info(f"Ignoring duplicate chat request for same message_id: {message_id}")
-                    return req_id
-        except Exception as e:
-            logger.error(f"Error parsing existing request: {e}")
-    
-    # Add new request to queue
     try:
-        await redis.hset(CHAT_API_QUEUE_KEY, request_id, json.dumps(request.to_dict()))
-        await redis.expire(CHAT_API_QUEUE_KEY, QUEUE_ITEM_EXPIRY)  # Set expiry on the queue
+        # Create a unique request ID
+        request_id = str(uuid.uuid4())
         
-        # Get current queue position for this request
-        position = await get_queue_position(request_id)
-        logger.info(f"Added request {request_id} to chat API queue at position {position}")
+        # Create message data
+        message_data = {
+            "request_id": request_id,
+            "user_id": user_id,
+            "message": message,
+            "source_type": source_type,
+            "source_id": source_id,
+            "response_token": response_token,
+            "chat_id": chat_id,
+            "chat_type": chat_type,
+            "message_id": message_id,
+            "timestamp": time.time(),
+            "status": STATUS_QUEUED
+        }
         
-        # Update stats
-        await redis.hincrby(CHAT_API_STATS_KEY, "total_requests", 1)
+        # Store callback for status updates
+        if status_callback:
+            # Create a wrapper callback that converts to QueuedRequest
+            async def callback_wrapper(message_data, status, response=None, error=None):
+                request = QueuedRequest.from_dict(message_data)
+                await status_callback(request, status, response, error)
+            
+            # Store the callback wrapper
+            _callbacks[request_id] = callback_wrapper
         
-        # Notify that request is queued
-        await request.notify_status(STATUS_QUEUED)
+        # Enqueue the request
+        result_id = await _queue_manager.enqueue(message_data, 
+                                               callback=_callbacks.get(request_id))
         
-        return request_id
+        if result_id:
+            # If we got back a different ID, it means a duplicate was found
+            if result_id != request_id:
+                logger.info(f"Duplicate request detected, using existing ID: {result_id}")
+                # Update the callback for the existing request
+                if status_callback:
+                    _callbacks[result_id] = _callbacks.pop(request_id)
+            
+            return result_id
+        else:
+            logger.error("Failed to enqueue chat request")
+            return None
+            
     except Exception as e:
         logger.error(f"Error enqueueing chat request: {e}")
+        service_status.record_error(e)
         return None
         
 async def get_queue_position(request_id: str) -> int:
     """Get the current position of a request in the queue."""
-    redis = await get_redis()
-    if not redis:
-        return -1
-        
     try:
-        # Get all requests in the queue
-        requests = await redis.hgetall(CHAT_API_QUEUE_KEY)
-        
-        # Sort by timestamp
-        sorted_requests = []
-        for req_id, req_data in requests.items():
-            try:
-                req = json.loads(req_data)
-                sorted_requests.append((req_id, req.get("timestamp", 0)))
-            except Exception:
-                continue
-                
-        sorted_requests.sort(key=lambda x: x[1])  # Sort by timestamp
-        
-        # Find position of our request
-        for i, (req_id, _) in enumerate(sorted_requests):
-            if req_id == request_id:
-                return i + 1  # 1-based position
-                
-        return -1  # Not found
+        return await _queue_manager.get_position(request_id)
     except Exception as e:
         logger.error(f"Error getting queue position: {e}")
         return -1
@@ -208,15 +180,16 @@ async def get_user_request(user_id: str) -> Optional[QueuedRequest]:
         return None
         
     try:
-        requests = await redis.hgetall(CHAT_API_QUEUE_KEY)
+        # Get all messages in the main queue
+        message_ids = await redis.zrange(_queue_manager.queue_main_key, 0, -1)
         
-        for req_data in requests.values():
-            try:
-                req = json.loads(req_data)
-                if req.get("user_id") == user_id:
-                    return QueuedRequest.from_dict(req)
-            except Exception:
-                continue
+        # Check each message
+        for message_id in message_ids:
+            message_id = message_id.decode('utf-8') if isinstance(message_id, bytes) else message_id
+            message_data = await _queue_manager.get_message(message_id)
+            
+            if message_data and message_data.get("user_id") == user_id:
+                return QueuedRequest.from_dict(message_data)
                 
         return None
     except Exception as e:
@@ -225,12 +198,8 @@ async def get_user_request(user_id: str) -> Optional[QueuedRequest]:
 
 async def get_queue_length() -> int:
     """Get the current length of the chat API queue."""
-    redis = await get_redis()
-    if not redis:
-        return 0
-        
     try:
-        return await redis.hlen(CHAT_API_QUEUE_KEY)
+        return await _queue_manager.get_queue_length(include_retry=True)
     except Exception as e:
         logger.error(f"Error getting queue length: {e}")
         return 0
@@ -245,53 +214,23 @@ async def try_acquire_chat_api_lock(timeout: int = 0) -> bool:
     Returns:
         True if lock was acquired, False otherwise
     """
-    redis = await get_redis()
-    if not redis:
-        return False
-        
-    if timeout <= 0:
-        # Just try once
-        try:
-            locked = await redis.set(
-                CHAT_API_LOCK_KEY, 
-                "1", 
-                nx=True,  # Only set if not exists
-                ex=LOCK_EXPIRY  # Auto-expire to prevent deadlocks
-            )
-            return locked
-        except Exception as e:
-            logger.error(f"Error acquiring chat API lock: {e}")
-            return False
-    else:
-        # Try for specified timeout
-        end_time = time.time() + timeout
-        while time.time() < end_time:
-            try:
-                locked = await redis.set(
-                    CHAT_API_LOCK_KEY, 
-                    "1", 
-                    nx=True,
-                    ex=LOCK_EXPIRY
-                )
-                if locked:
-                    return True
-            except Exception as e:
-                logger.error(f"Error acquiring chat API lock: {e}")
-                
-            # Wait a bit before retrying
-            await asyncio.sleep(0.5)
-            
+    try:
+        return await _queue_manager.try_acquire_lock(
+            "global_lock",  # Use a fixed ID for the global lock
+            "processor",    # Owner identifier
+            timeout=timeout
+        )
+    except Exception as e:
+        logger.error(f"Error acquiring chat API lock: {e}")
         return False
 
 async def release_chat_api_lock() -> bool:
     """Release the chat API lock."""
-    redis = await get_redis()
-    if not redis:
-        return False
-        
     try:
-        await redis.delete(CHAT_API_LOCK_KEY)
-        return True
+        return await _queue_manager.release_lock(
+            "global_lock",  # Use a fixed ID for the global lock
+            "processor"     # Owner identifier
+        )
     except Exception as e:
         logger.error(f"Error releasing chat API lock: {e}")
         return False
@@ -314,28 +253,40 @@ async def process_chat_api_queue():
                 continue
                 
             # Get next request from queue
-            next_request = await get_next_request()
+            next_message_id = await _queue_manager.get_next_message()
             
-            if not next_request:
+            if not next_message_id:
                 # No requests in queue, release lock and wait
                 await release_chat_api_lock()
                 await asyncio.sleep(1)
                 continue
                 
+            # Get the message data
+            message_data = await _queue_manager.get_message(next_message_id)
+            if not message_data:
+                # Message disappeared, release lock and continue
+                await release_chat_api_lock()
+                continue
+                
+            # Convert to QueuedRequest for backward compatibility
+            next_request = QueuedRequest.from_dict(message_data)
+            
             # Process the request
             logger.info(f"Processing chat API request for user {next_request.user_id}")
             
             # Update status to "processing"
-            await update_request_status(next_request.request_id, STATUS_PROCESSING)
+            await _queue_manager.update_message(next_message_id, {"status": STATUS_PROCESSING})
             
             # Notify that request is processing
-            await next_request.notify_status(STATUS_PROCESSING)
+            callback = _callbacks.get(next_message_id)
+            if callback:
+                await callback(message_data, STATUS_PROCESSING)
             
             # Actually process the request
             await process_chat_request(next_request)
             
             # Remove the request from queue
-            await remove_request(next_request.request_id)
+            await _queue_manager.remove_message(next_message_id)
             
             # Release the lock for the next worker
             await release_chat_api_lock()
@@ -354,74 +305,38 @@ async def process_chat_api_queue():
 
 async def get_next_request() -> Optional[QueuedRequest]:
     """Get the next request from the queue."""
-    redis = await get_redis()
-    if not redis:
-        return None
-        
     try:
-        # Get all requests and sort by timestamp
-        requests = await redis.hgetall(CHAT_API_QUEUE_KEY)
-        
-        if not requests:
+        # Get next message ID
+        message_id = await _queue_manager.get_next_message()
+        if not message_id:
             return None
             
-        # Parse and sort by timestamp
-        parsed_requests = []
-        for req_id, req_data in requests.items():
-            try:
-                req_dict = json.loads(req_data)
-                parsed_requests.append((req_id, req_dict.get("timestamp", 0), req_dict))
-            except Exception as e:
-                logger.error(f"Error parsing request data: {e}")
-                continue
-                
-        if not parsed_requests:
+        # Get message data
+        message_data = await _queue_manager.get_message(message_id)
+        if not message_data:
             return None
             
-        # Sort by timestamp (oldest first)
-        parsed_requests.sort(key=lambda x: x[1])
-        
-        # Get the oldest request
-        _, _, req_dict = parsed_requests[0]
-        
-        # Convert to QueuedRequest object
-        return QueuedRequest.from_dict(req_dict)
+        # Convert to QueuedRequest
+        return QueuedRequest.from_dict(message_data)
     except Exception as e:
         logger.error(f"Error getting next request: {e}")
         return None
 
 async def update_request_status(request_id: str, status: str) -> bool:
     """Update the status of a request in Redis."""
-    redis = await get_redis()
-    if not redis:
-        return False
-        
     try:
-        # Get the request
-        req_data = await redis.hget(CHAT_API_QUEUE_KEY, request_id)
-        if not req_data:
-            return False
-            
-        # Parse and update status
-        req_dict = json.loads(req_data)
-        req_dict["status"] = status
-        
-        # Save back to Redis
-        await redis.hset(CHAT_API_QUEUE_KEY, request_id, json.dumps(req_dict))
-        return True
+        return await _queue_manager.update_message(request_id, {"status": status})
     except Exception as e:
         logger.error(f"Error updating request status: {e}")
         return False
 
 async def remove_request(request_id: str) -> bool:
     """Remove a request from the queue."""
-    redis = await get_redis()
-    if not redis:
-        return False
-        
     try:
-        await redis.hdel(CHAT_API_QUEUE_KEY, request_id)
-        return True
+        result = await _queue_manager.remove_message(request_id)
+        # Clean up callback
+        _callbacks.pop(request_id, None)
+        return result
     except Exception as e:
         logger.error(f"Error removing request: {e}")
         return False
