@@ -1,0 +1,29 @@
+FROM python:3.10-slim
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    curl \
+    gcc \
+    python3-dev \
+    libffi-dev \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements first for better caching
+COPY requirements-whatsapp.txt .
+RUN pip install --no-cache-dir -r requirements-whatsapp.txt
+
+# Create a minimal common directory structure
+RUN mkdir -p ./common
+COPY common/__init__.py ./common/
+
+# Copy application code
+COPY whatsapp_pubsub.py .
+
+# Set up health check endpoint
+EXPOSE 8082
+
+# Command to run the application
+CMD ["python", "whatsapp_pubsub.py"]

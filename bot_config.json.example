@@ -52,5 +52,38 @@
         }
       ]
     }
-  ]
+  ],
+  "whatsapp": {
+    "token": "your_whatsapp_business_api_token_here",
+    "phone_number_id": "your_phone_number_id_here", 
+    "verify_token": "your_webhook_verify_token",  
+    "webhook_url": "https://your-ngrok-url.ngrok.io/webhook",
+    "enabled": true,
+    "rules": [
+      {
+        "regex": "^help$",
+        "response_type": "message",
+        "response_content": "Available WhatsApp commands:\nhelp - Show this message\ntime - Show current time\nstatus - Check system status\ntest - Run a test command",
+        "context": "both"
+      },
+      {
+        "regex": "^time$",
+        "response_type": "script",
+        "response_content": "date",
+        "context": "both"
+      },
+      {
+        "regex": "^status$",
+        "response_type": "script",
+        "response_content": "uptime",
+        "context": "both"
+      },
+      {
+        "regex": "^test$",
+        "response_type": "message",
+        "response_content": "This is a test response from your WhatsApp bot!",
+        "context": "both"
+      }
+    ]
+  }
 }

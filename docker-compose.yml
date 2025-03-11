@@ -42,6 +42,42 @@ services:
       retries: 2
       start_period: 30s
 
+  whatsapp-pubsub:
+    build:
+      context: .
+      dockerfile: Dockerfile.whatsapp-pubsub
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-changeme}
+      - BOT_CONFIG_PATH=/app/bot_config.json
+      - LOG_LEVEL=DEBUG        # Set to DEBUG for more verbose logging
+      - PYTHONUNBUFFERED=1     # Ensure logs are output immediately
+      - WEBHOOK_VERIFY_TOKEN=${WEBHOOK_VERIFY_TOKEN:-your_verification_token}
+      - TOKEN_REFRESH_URL=${WHATSAPP_TOKEN_REFRESH_URL:-}  # URL for token refresh API
+      - TOKEN_REFRESH_INTERVAL=${WHATSAPP_TOKEN_REFRESH_INTERVAL:-21600}  # Default 6 hours
+      - AUTO_REFRESH_TOKEN=${WHATSAPP_AUTO_REFRESH_TOKEN:-false}  # Default disabled
+    volumes:
+      - ./bot_config.json:/app/bot_config.json:ro
+      - ./scripts:/app/scripts:ro  # Mount scripts directory for consistency
+    depends_on:
+      - redis
+    networks:
+      - app-network
+    ports:
+      - "${WHATSAPP_PORT:-8082}:8082"  # Make port configurable via env var
+    restart: on-failure
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.whatsapp.rule=Host(`whatsapp.localhost`)"
+      - "traefik.http.services.whatsapp.loadbalancer.server.port=8082"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8082/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 2
+      start_period: 30s
+
   # Main bot logic workers - one designated as chat-api queue processor
   bot-logic-primary:
     build:
@@ -102,6 +138,22 @@ services:
       timeout: 10s
       retries: 2
       start_period: 30s
+
+  # Add traefik reverse proxy for local development
+  traefik:
+    image: traefik:v2.9
+    command:
+      - "--api.insecure=true"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+    ports:
+      - "80:80"
+      - "8080:8080"  # Traefik dashboard
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - app-network
 
 networks:
   app-network:
