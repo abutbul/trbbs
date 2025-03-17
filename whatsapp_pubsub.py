@@ -1,6 +1,6 @@
 import os
 import json
-import time  # Add missing time module import
+import time
 import logging
 import asyncio
 import redis
@@ -27,25 +27,53 @@ root_logger.setLevel(logging_level)
 for handler in root_logger.handlers:
     handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
 
-# Load configuration
-BOT_CONFIG_PATH = os.environ.get("BOT_CONFIG_PATH", "bot_config.json")
-
-# Redis configuration
+# Load configuration from environment variables
 REDIS_HOST = os.environ.get("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.environ.get("REDIS_PORT", 6379))
 REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD", "")
 REDIS_DB = int(os.environ.get("REDIS_DB", 0))
 
-# Webhook verification token
+# Bot Configuration
+BOT_CONFIG_PATH = os.environ.get("BOT_CONFIG_PATH", "/app/bot_config.json")
+
+# Webhook Configuration
 WEBHOOK_VERIFY_TOKEN = os.environ.get("WEBHOOK_VERIFY_TOKEN", "your_verification_token")
 
 # Token refresh settings
-TOKEN_REFRESH_URL = os.environ.get("TOKEN_REFRESH_URL", "")
-TOKEN_REFRESH_INTERVAL = int(os.environ.get("TOKEN_REFRESH_INTERVAL", 6 * 60 * 60))  # Default 6 hours
-AUTO_REFRESH_TOKEN = os.environ.get("AUTO_REFRESH_TOKEN", "false").lower() == "true"
+WHATSAPP_TOKEN_REFRESH_URL = os.environ.get("WHATSAPP_TOKEN_REFRESH_URL", "")
+WHATSAPP_TOKEN_REFRESH_INTERVAL = int(os.environ.get("WHATSAPP_TOKEN_REFRESH_INTERVAL", 21600))  # Default 6 hours
+WHATSAPP_AUTO_REFRESH_TOKEN = os.environ.get("WHATSAPP_AUTO_REFRESH_TOKEN", "false").lower() == "true"
 
 # Create global instance for lifespan context
 whatsapp_pubsub_instance = None
+
+def load_bot_config(config_path: str = None) -> Dict[str, Any]:
+    """Load bot configuration from the specified path."""
+    if config_path is None:
+        config_path = BOT_CONFIG_PATH
+        
+    try:
+        with open(config_path, "r") as f:
+            config = json.load(f)
+            
+        # Log configuration details (sanitized)
+        bot_count = len(config.get('bots', []))
+        enabled_bots = sum(1 for bot in config.get('bots', []) if bot.get('enabled', True))
+        
+        # Log WhatsApp configuration details if present
+        wa_info = ""
+        if "whatsapp" in config:
+            wa_config = config.get("whatsapp", {})
+            has_token = bool(wa_config.get("token"))
+            has_phone_id = bool(wa_config.get("phone_number_id"))
+            is_enabled = wa_config.get("enabled", False)
+            wa_info = f", WhatsApp: enabled={is_enabled}, token_present={has_token}, phone_id_present={has_phone_id}"
+            
+        logger.info(f"Loaded configuration with {bot_count} bots ({enabled_bots} enabled){wa_info}")
+        return config
+    except Exception as e:
+        logger.error(f"Error loading bot config from {config_path}: {e}")
+        return {"bots": []}
 
 class WhatsAppWrapper:
     """Wrapper around the heyoo WhatsApp client to handle errors consistently"""
@@ -155,40 +183,13 @@ class WhatsAppPubSub:
             raise
             
         # Load bot configuration
-        self.bot_config = self._load_bot_config()
+        self.bot_config = load_bot_config()
         self.whatsapp_client = None  # Will be initialized in setup_whatsapp
         self.health_check_task = None
         self.token_refresh_task = None
         self.last_token_refresh = datetime.now()
         self.token_expiry_detected = False
         
-    def _load_bot_config(self) -> Dict:
-        """Load bot configuration from the specified path."""
-        try:
-            with open(BOT_CONFIG_PATH, "r") as f:
-                config = json.load(f)
-                logger.info(f"Successfully loaded bot configuration from {BOT_CONFIG_PATH}")
-                
-                # Log WhatsApp configuration details (sanitized)
-                if "whatsapp" in config:
-                    wa_config = config.get("whatsapp", {})
-                    has_token = bool(wa_config.get("token"))
-                    has_phone_id = bool(wa_config.get("phone_number_id"))
-                    is_enabled = wa_config.get("enabled", False)
-                    num_rules = len(wa_config.get("rules", []))
-                    
-                    logger.info(f"WhatsApp config: token_present={has_token}, "
-                                f"phone_id_present={has_phone_id}, enabled={is_enabled}, "
-                                f"rules_count={num_rules}")
-                else:
-                    logger.warning("No WhatsApp configuration found in bot_config.json")
-                
-                return config
-        except Exception as e:
-            logger.error(f"Failed to load bot configuration: {e}")
-            logger.error(traceback.format_exc())
-            return {}
-
     async def setup_whatsapp(self):
         """Set up WhatsApp client based on config."""
         try:
@@ -212,9 +213,9 @@ class WhatsAppPubSub:
                 self.health_check_task = asyncio.create_task(self._periodic_health_check())
                 
                 # Start token refresh task if enabled
-                if AUTO_REFRESH_TOKEN and TOKEN_REFRESH_URL:
+                if WHATSAPP_AUTO_REFRESH_TOKEN and WHATSAPP_TOKEN_REFRESH_URL:
                     self.token_refresh_task = asyncio.create_task(self._periodic_token_refresh())
-                    logger.info(f"Token auto-refresh enabled, interval: {TOKEN_REFRESH_INTERVAL} seconds")
+                    logger.info(f"Token auto-refresh enabled, interval: {WHATSAPP_TOKEN_REFRESH_INTERVAL} seconds")
                 else:
                     logger.info("Token auto-refresh disabled")
                 
@@ -263,7 +264,7 @@ class WhatsAppPubSub:
         while True:
             try:
                 # Wait for the refresh interval
-                await asyncio.sleep(TOKEN_REFRESH_INTERVAL)
+                await asyncio.sleep(WHATSAPP_TOKEN_REFRESH_INTERVAL)
                 
                 # Refresh the token
                 success = await self.refresh_token()
@@ -279,15 +280,15 @@ class WhatsAppPubSub:
     
     async def refresh_token(self):
         """Refresh the WhatsApp API token"""
-        if not TOKEN_REFRESH_URL:
+        if not WHATSAPP_TOKEN_REFRESH_URL:
             logger.warning("Token refresh URL not configured")
             return False
             
         try:
-            logger.info(f"Attempting to refresh WhatsApp token from {TOKEN_REFRESH_URL}")
+            logger.info(f"Attempting to refresh WhatsApp token from {WHATSAPP_TOKEN_REFRESH_URL}")
             
             # Make request to token refresh endpoint
-            response = requests.get(TOKEN_REFRESH_URL, timeout=30)
+            response = requests.get(WHATSAPP_TOKEN_REFRESH_URL, timeout=30)
             
             if response.status_code == 200:
                 # Parse the response and extract new token
@@ -431,7 +432,7 @@ class WhatsAppPubSub:
                 logger.error(f"WhatsApp token has expired: {error_info}")
                 
                 # Try to refresh the token immediately
-                if TOKEN_REFRESH_URL:
+                if WHATSAPP_TOKEN_REFRESH_URL:
                     logger.info("Attempting immediate token refresh...")
                     refresh_success = await self.refresh_token()
                     
@@ -598,9 +599,9 @@ async def debug_info():
         }
         
         token_info = {
-            "auto_refresh_enabled": AUTO_REFRESH_TOKEN,
-            "refresh_interval_hours": TOKEN_REFRESH_INTERVAL / 3600,
-            "refresh_url_configured": bool(TOKEN_REFRESH_URL),
+            "auto_refresh_enabled": WHATSAPP_AUTO_REFRESH_TOKEN,
+            "refresh_interval_hours": WHATSAPP_TOKEN_REFRESH_INTERVAL / 3600,
+            "refresh_url_configured": bool(WHATSAPP_TOKEN_REFRESH_URL),
             "last_refresh": whatsapp_pubsub_instance.last_token_refresh.isoformat() 
                             if hasattr(whatsapp_pubsub_instance, 'last_token_refresh') else None,
             "expiry_detected": whatsapp_pubsub_instance.token_expiry_detected

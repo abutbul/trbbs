@@ -6,7 +6,11 @@ import os
 from typing import List, Optional, Dict, Any, Tuple
 from telegram import Bot, Update
 from telegram.error import TelegramError, Conflict
-from telegram_bot.core.config import TELEGRAM_BOT_TOKEN
+from telegram_bot.core.config import (
+    TELEGRAM_BOT_TOKEN, 
+    BOT_CONFIG_PATH,
+    load_bot_config
+)
 from telegram_bot.core.status import service_status
 
 logger = logging.getLogger(__name__)
@@ -19,25 +23,6 @@ bot_lock = asyncio.Lock()
 token_locks = {}
 last_update_attempt = 0
 updates_in_progress = False
-
-# Load bot configuration
-BOT_CONFIG_PATH = os.environ.get("BOT_CONFIG_PATH", "/app/bot_config.json")
-
-def load_bot_config():
-    """Load bot configuration from JSON file."""
-    try:
-        with open(BOT_CONFIG_PATH, 'r') as f:
-            config = json.load(f)
-        
-        # Log the bots found
-        bot_count = len(config.get('bots', []))
-        enabled_bots = sum(1 for bot in config.get('bots', []) if bot.get('enabled', True))
-        logger.info(f"Loaded configuration with {bot_count} bots ({enabled_bots} enabled)")
-        
-        return config
-    except Exception as e:
-        logger.error(f"Error loading bot config from {BOT_CONFIG_PATH}: {e}")
-        return {"bots": []}
 
 # Get list of bot tokens from config
 def get_bot_tokens():

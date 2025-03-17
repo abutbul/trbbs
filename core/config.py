@@ -27,6 +27,23 @@ BOT_CONFIG_PATH = os.environ.get("BOT_CONFIG_PATH", "/app/bot_config.json")
 # Telegram Configuration
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 
+# WhatsApp Configuration 
+WEBHOOK_VERIFY_TOKEN = os.environ.get("WEBHOOK_VERIFY_TOKEN", "your_verification_token")
+WHATSAPP_TOKEN_REFRESH_URL = os.environ.get("WHATSAPP_TOKEN_REFRESH_URL", "")
+WHATSAPP_TOKEN_REFRESH_INTERVAL = int(os.environ.get("WHATSAPP_TOKEN_REFRESH_INTERVAL", 21600))
+WHATSAPP_AUTO_REFRESH_TOKEN = os.environ.get("WHATSAPP_AUTO_REFRESH_TOKEN", "false").lower() == "true"
+
+# API Configuration
+API_CHAT_URL = os.environ.get("API_CHAT_URL", "http://host.docker.internal:8000/message")
+API_TIMEOUT = float(os.environ.get("API_TIMEOUT", "190.0"))
+API_RETRIES = int(os.environ.get("API_RETRIES", "2"))
+API_RETRY_DELAY = float(os.environ.get("API_RETRY_DELAY", "1.0"))
+
+# Queue Configuration
+MAX_CONCURRENT_CHAT_REQUESTS = int(os.environ.get("MAX_CONCURRENT_CHAT_REQUESTS", "1"))
+ENABLE_QUEUE_WORKER = os.environ.get("ENABLE_QUEUE_WORKER", "true").lower() == "true"
+REPLICA_ID = int(os.environ.get("REPLICA_ID", "0"))
+
 # Settings for Telegram bot
 ENABLE_REACTIONS = os.environ.get("ENABLE_REACTIONS", "true").lower() == "true"
 UPDATE_POLLING_INTERVAL = float(os.environ.get("UPDATE_POLLING_INTERVAL", "5.0"))
@@ -41,7 +58,7 @@ DEBUG_MODE = os.environ.get("DEBUG_MODE", "false").lower() == "true"
 
 # Set debug logging if enabled
 if DEBUG_MODE or logging_level.upper() == "DEBUG":
-    logging.getLogger('telegram_bot').setLevel(logging.DEBUG)
+    logging.getLogger().setLevel(logging.DEBUG)
     logging.getLogger('httpx').setLevel(logging.DEBUG)
     logging.getLogger('asyncio').setLevel(logging.DEBUG)
 
