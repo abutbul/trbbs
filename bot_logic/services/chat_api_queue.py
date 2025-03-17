@@ -10,7 +10,7 @@ from bot_logic.services.redis_service import get_redis
 from bot_logic.services.api_service import send_chat_message
 from bot_logic.services.response_service import send_response
 from bot_logic.core.status import service_status
-from bot_logic.services.reaction_service import update_to_completed_reaction
+from bot_logic.services.reaction_service import update_to_completed_reaction, add_reaction
 from bot_logic.services.redis_queue_manager import RedisQueueManager, STATUS_QUEUED, STATUS_PROCESSING, STATUS_COMPLETED, STATUS_ERROR
 
 logger = logging.getLogger(__name__)
@@ -143,17 +143,25 @@ async def enqueue_chat_request(user_id: str, message: str,
             # Store the callback wrapper
             _callbacks[request_id] = callback_wrapper
         
-        # Enqueue the request
-        result_id = await _queue_manager.enqueue(message_data, 
-                                               callback=_callbacks.get(request_id))
+        # Enqueue the request - now returns a tuple (id, is_duplicate)
+        result_id, is_duplicate = await _queue_manager.enqueue(message_data, 
+                                                 callback=_callbacks.get(request_id))
         
         if result_id:
-            # If we got back a different ID, it means a duplicate was found
+            # If we got back a different ID and it's a duplicate
             if result_id != request_id:
                 logger.info(f"Duplicate request detected, using existing ID: {result_id}")
                 # Update the callback for the existing request
                 if status_callback:
                     _callbacks[result_id] = _callbacks.pop(request_id)
+                
+                # If this was a duplicate and we have a message_id, add the monkey reaction
+                if is_duplicate and message_id:
+                    logger.info(f"Adding 🙈 reaction to duplicate message {message_id}")
+                    try:
+                        await add_reaction(source_type, message_id, "🙈", response_token, chat_id)
+                    except Exception as e:
+                        logger.error(f"Failed to add duplicate reaction: {e}")
             
             return result_id
         else:

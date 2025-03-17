@@ -63,7 +63,7 @@ class RedisQueueManager:
         self._should_stop = False
     
     async def enqueue(self, message_data: Dict[str, Any], 
-                     callback: Optional[Callable] = None) -> Optional[str]:
+                     callback: Optional[Callable] = None) -> Tuple[Optional[str], bool]:
         """
         Add a message to the queue with deduplication.
         
@@ -72,12 +72,12 @@ class RedisQueueManager:
             callback: Optional callback function for status updates
             
         Returns:
-            Message ID if successful, None otherwise
+            Tuple of (Message ID, is_duplicate) if successful, (None, False) otherwise
         """
         redis = await get_redis()
         if not redis:
             logger.error("Failed to get Redis connection for enqueueing message")
-            return None
+            return None, False
         
         try:
             # Generate a unique message ID if not provided
@@ -104,8 +104,28 @@ class RedisQueueManager:
                 existing_id = await redis.get(dedup_key)
                 
                 if existing_id:
-                    logger.info(f"Duplicate message detected, returning existing ID: {existing_id}")
-                    return existing_id.decode('utf-8') if isinstance(existing_id, bytes) else existing_id
+                    existing_id = existing_id.decode('utf-8') if isinstance(existing_id, bytes) else existing_id
+                    
+                    # Get the existing message to check its status and age
+                    should_deduplicate = True
+                    existing_msg = await self.get_message(existing_id)
+                    
+                    if existing_msg:
+                        # Don't deduplicate if the message has already been processed
+                        if existing_msg.get("status") in [STATUS_COMPLETED, STATUS_ERROR]:
+                            logger.info(f"Message with ID {existing_id} already processed, allowing new request")
+                            should_deduplicate = False
+                        else:
+                            # Check if the message is older than 2 minutes
+                            now = time.time()
+                            msg_time = float(existing_msg.get("timestamp", 0))
+                            if now - msg_time > 120:  # 2 minutes in seconds
+                                logger.info(f"Message with ID {existing_id} is older than 2 minutes, allowing new request")
+                                should_deduplicate = False
+                    
+                    if should_deduplicate:
+                        logger.info(f"Duplicate message detected, returning existing ID: {existing_id}")
+                        return existing_id, True  # Return tuple with is_duplicate=True
                 
                 # Store deduplication key with expiry
                 await redis.set(dedup_key, message_id, ex=self.dedup_expiry)
@@ -143,12 +163,12 @@ class RedisQueueManager:
             # Notify about queued status
             await self._notify_status(message_id, STATUS_QUEUED)
             
-            return message_id
+            return message_id, False  # Return tuple with is_duplicate=False
             
         except Exception as e:
             logger.error(f"Error enqueueing message: {e}")
             service_status.record_error(e)
-            return None
+            return None, False
     
     async def get_position(self, message_id: str) -> int:
         """
