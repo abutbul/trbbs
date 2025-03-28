@@ -233,7 +233,7 @@ async def poll_all_bots(last_update_ids=None):
     
     return all_updates, last_update_ids
 
-async def send_message(chat_id: int, text: str, token=None, **kwargs) -> bool:
+async def send_message(chat_id: int, text: str, token=None, reply_to_message_id=None, response_mode="new_message", **kwargs) -> bool:
     """Send a message to a Telegram chat with error handling."""
     tokens = get_bot_tokens() if token is None else [(token, "specified")]
     
@@ -246,6 +246,28 @@ async def send_message(chat_id: int, text: str, token=None, **kwargs) -> bool:
     
     try:
         bot = await get_telegram_bot(token)
+        
+        # If response_mode is "reply" and we have a reply_to_message_id, use it
+        if response_mode == "reply" and reply_to_message_id:
+            # Convert to int if it's a string
+            if isinstance(reply_to_message_id, str) and reply_to_message_id.isdigit():
+                reply_to_message_id = int(reply_to_message_id)
+            
+            # Try to use the reply_to_message_id
+            try:
+                await bot.send_message(
+                    chat_id=chat_id, 
+                    text=text, 
+                    reply_to_message_id=reply_to_message_id, 
+                    **kwargs
+                )
+                logger.info(f"Sent reply to message {reply_to_message_id}")
+                return True
+            except Exception as e:
+                logger.warning(f"Failed to send as reply, falling back to new message: {e}")
+                # Continue to send as new message if reply fails
+        
+        # Send as new message (default or fallback)
         await bot.send_message(chat_id=chat_id, text=text, **kwargs)
         return True
     except Exception as e:

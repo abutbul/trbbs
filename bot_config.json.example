@@ -10,13 +10,15 @@
           "regex": "^\\/help$",
           "response_type": "message",
           "response_content": "Available commands:\n/help - Show this message\n/time - Show current time\n/status - Check system status",
-          "context": "both"
+          "context": "both",
+          "response_mode": "reply"  // Will reply to the original message
         },
         {
           "regex": "^\\/time$",
           "response_type": "script",
           "response_content": "date",
-          "context": "both"
+          "context": "both",
+          "response_mode": "new_message"  // Will send as a new message (default)
         },
         {
           "regex": "^\\/status$",

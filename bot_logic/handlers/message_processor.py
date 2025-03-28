@@ -177,13 +177,13 @@ async def process_matching_rules(matches, source_type, source_id, chat_id, chat_
         # Extract message_id for reaction management
         message_id = original_message_data.get("message_id") if original_message_data else None
         
+        # Make sure to include response_mode in the message data when sending the response:
+        rule_response_mode = rule.get("response_mode", "new_message")
+        original_message_data["response_mode"] = rule_response_mode
+        
         if response_type == "message":
             # Simple text response - include chat_id and chat_type
-            await send_response(source_type, source_id, response_content, {
-                "bot_token": response_token, 
-                "chat_id": chat_id,
-                "chat_type": chat_type
-            })
+            await send_response(source_type, source_id, response_content, original_message_data)
         elif response_type == "script":
             # Execute script and return output
             # Pass the original message for argument extraction
@@ -333,6 +333,8 @@ async def execute_api_chat_response(message_content, source_type, source_id, res
             status_callback=handle_request_status_change  # Pass our status callback
         )
         
+        logger.info(f"Enqueued API chat request with ID: {request_id}")
+        
         # If enqueuing failed
         if not request_id:
             await send_response(source_type, source_id, 
@@ -347,12 +349,15 @@ async def execute_api_chat_response(message_content, source_type, source_id, res
         
         # Get queue position
         position = await get_queue_position(request_id)
+        logger.info(f"Request {request_id} is at position {position} in queue")
         
         # Send queue position information only if not first in line
         if position > 1:
             # Add dove reaction instead of sending message
             await add_reaction(source_type, original_message_id, "🕊", response_token, chat_id)
-        # For position 1, we add the reaction in the status callback
+            logger.info(f"Added dove reaction for queued request at position {position}")
+        else:
+            logger.info(f"Request is first in queue, will process immediately")
         
     except Exception as e:
         api_response = f"Error queuing request for API chat service: {e}"
@@ -436,6 +441,7 @@ async def handle_request_status_change(request, status, response=None, error=Non
         elif status == "completed":
             # Update reaction from processing to completed
             await update_to_completed_reaction(source_type, message_id, bot_token, chat_id)
+            logger.info(f"Request {request.request_id} completed, updated reaction")
             
             # Remove from tracking
             _active_requests.pop(request_key, None)
@@ -443,6 +449,7 @@ async def handle_request_status_change(request, status, response=None, error=Non
         elif status == "error":
             # Add error reaction
             await add_error_reaction(source_type, message_id, bot_token, chat_id)
+            logger.info(f"Request {request.request_id} encountered error, updated reaction")
             
             # Remove from tracking
             _active_requests.pop(request_key, None)

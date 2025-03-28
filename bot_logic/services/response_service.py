@@ -18,7 +18,11 @@ async def send_response(source_type, source_id, content, original_message):
             "bot_token": original_message.get("bot_token"),
             # Include chat_id and chat_type for proper response routing
             "chat_id": original_message.get("chat_id", source_id),
-            "chat_type": original_message.get("chat_type", "dm")
+            "chat_type": original_message.get("chat_type", "dm"),
+            # Add message_id for reply functionality
+            "reply_to_message_id": original_message.get("message_id"),
+            # Include response mode from rule if available, default to "new_message"
+            "response_mode": original_message.get("response_mode", "new_message")
         }
         
         # Publish to responses channel

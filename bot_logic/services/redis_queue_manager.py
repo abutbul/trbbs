@@ -115,6 +115,8 @@ class RedisQueueManager:
                         if existing_msg.get("status") in [STATUS_COMPLETED, STATUS_ERROR]:
                             logger.info(f"Message with ID {existing_id} already processed, allowing new request")
                             should_deduplicate = False
+                            # Clear the dedup key since the message is already processed
+                            await self.clear_deduplication_key(message_data["user_id"], message_data["message"])
                         else:
                             # Check if the message is older than 2 minutes
                             now = time.time()
@@ -122,13 +124,20 @@ class RedisQueueManager:
                             if now - msg_time > 120:  # 2 minutes in seconds
                                 logger.info(f"Message with ID {existing_id} is older than 2 minutes, allowing new request")
                                 should_deduplicate = False
+                                # Clear old deduplication key
+                                await self.clear_deduplication_key(message_data["user_id"], message_data["message"])
                     
                     if should_deduplicate:
                         logger.info(f"Duplicate message detected, returning existing ID: {existing_id}")
+                        # Store the dedup key in the message data for later reference
+                        if existing_msg:
+                            await self.update_message(existing_id, {"dedup_key": dedup_key})
                         return existing_id, True  # Return tuple with is_duplicate=True
                 
                 # Store deduplication key with expiry
                 await redis.set(dedup_key, message_id, ex=self.dedup_expiry)
+                # Store the dedup key in the message data for later reference
+                message_data["dedup_key"] = dedup_key
             
             # Store the message data as a hash
             msg_key = self._get_message_key(message_id)
@@ -284,6 +293,9 @@ class RedisQueueManager:
             return False
         
         try:
+            # First, clear any deduplication key associated with this message
+            await self.clear_deduplication_key_by_id(message_id)
+            
             msg_key = self._get_message_key(message_id)
             
             # Use pipeline for atomic operations
@@ -820,3 +832,71 @@ class RedisQueueManager:
     def _remove_callback(self, message_id: str):
         """Remove callback function from memory."""
         self._callbacks.pop(message_id, None)
+    
+    async def clear_deduplication_key(self, user_id: str, message: str) -> bool:
+        """
+        Clear a deduplication key for a user's message.
+        
+        Args:
+            user_id: User identifier
+            message: Message content
+            
+        Returns:
+            True if the key was cleared, False otherwise
+        """
+        redis = await get_redis()
+        if not redis:
+            return False
+            
+        try:
+            # Generate the deduplication key
+            dedup_key = self._get_dedup_key(user_id, message)
+            
+            # Delete the key
+            await redis.delete(dedup_key)
+            logger.info(f"Cleared deduplication key for user {user_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Error clearing deduplication key: {e}")
+            return False
+            
+    async def clear_deduplication_key_by_id(self, message_id: str) -> bool:
+        """
+        Clear a deduplication key for a message by its ID.
+        
+        Args:
+            message_id: Message identifier
+            
+        Returns:
+            True if the key was cleared, False otherwise
+        """
+        redis = await get_redis()
+        if not redis:
+            return False
+            
+        try:
+            # Get the message
+            message = await self.get_message(message_id)
+            if not message:
+                logger.warning(f"Message {message_id} not found when trying to clear dedup key")
+                return False
+                
+            # Check if the message has a stored dedup_key
+            dedup_key = message.get("dedup_key")
+            if dedup_key:
+                # Delete the key directly
+                await redis.delete(dedup_key)
+                logger.info(f"Cleared stored deduplication key for message {message_id}")
+                return True
+                
+            # If no stored key, try to regenerate it
+            user_id = message.get("user_id")
+            msg_content = message.get("message")
+            if user_id and msg_content:
+                return await self.clear_deduplication_key(user_id, msg_content)
+                
+            logger.warning(f"Could not determine deduplication key for message {message_id}")
+            return False
+        except Exception as e:
+            logger.error(f"Error clearing deduplication key by ID: {e}")
+            return False

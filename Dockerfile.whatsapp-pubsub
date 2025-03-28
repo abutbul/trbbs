@@ -15,10 +15,6 @@ RUN apt-get update && apt-get install -y \
 COPY requirements-whatsapp.txt .
 RUN pip install --no-cache-dir -r requirements-whatsapp.txt
 
-# Create a minimal common directory structure
-RUN mkdir -p ./common
-COPY common/__init__.py ./common/
-
 # Copy application code
 COPY whatsapp_pubsub.py .
 

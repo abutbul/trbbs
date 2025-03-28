@@ -385,6 +385,20 @@ async def process_chat_request(request: QueuedRequest):
         redis = await get_redis()
         if redis:
             await redis.hincrby(CHAT_API_STATS_KEY, "processed_requests", 1)
+        
+        # Create a new deduplication key that will expire in 5 seconds
+        # This ensures a brief protection against double-submits but allows
+        # quick re-submission after a response is received
+        try:
+            user_id = f"{request.source_type}:{request.source_id}"
+            # Use a short expiry time for completed requests
+            dedup_key = _queue_manager._get_dedup_key(user_id, request.message)
+            redis = await get_redis()
+            if redis:
+                await redis.set(dedup_key, request.request_id, ex=5)  # 5 seconds expiry
+                logger.info(f"Set short-lived deduplication key after processing request")
+        except Exception as e:
+            logger.warning(f"Could not set short-lived deduplication key: {e}")
             
     except Exception as e:
         logger.error(f"Error processing chat request: {e}")
